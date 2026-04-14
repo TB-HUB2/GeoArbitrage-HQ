@@ -1,0 +1,213 @@
+{
+  "name": "Weekly Report Generator",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        400
+      ],
+      "id": "trigger",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 1: Sammle alle relevanten Daten aus Supabase\nconst scanDate = new Date().toISOString().split('T')[0];\nconst oneMonthAgo = new Date(Date.now() - 30*86400000).toISOString().split('T')[0];\nconst threeMonthsAgo = new Date(Date.now() - 90*86400000).toISOString().split('T')[0];\nconst sixMonthsAgo = new Date(Date.now() - 180*86400000).toISOString().split('T')[0];\nconst oneYearAgo = new Date(Date.now() - 365*86400000).toISOString().split('T')[0];\nconst in30d = new Date(Date.now() + 30*86400000).toISOString().split('T')[0];\n\nconst supaFetch = async (path) => {\n  const resp = await fetch(`${$env.SUPABASE_URL}/rest/v1/${path}`, {\n    headers: {\n      'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n      'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`\n    },\n    signal: AbortSignal.timeout(10000)\n  });\n  const data = await resp.json();\n  return Array.isArray(data) ? data : [];\n};\n\n// Wealth Snapshots\nconst snapshots = await supaFetch('wealth_snapshots?order=snapshot_date.desc&limit=12');\nconst currentWealth = snapshots[0] || null;\n\n// Budget\nconst budget = await supaFetch('budget?order=created_at.desc&limit=12');\n\n// Portfolio Holdings\nconst holdings = await supaFetch('portfolio_holdings?select=*');\n\n// Properties\nconst properties = await supaFetch('properties?status=eq.active&select=*');\n\n// Actions + Deadlines next 30 days\nconst actions = await supaFetch(`actions?deadline=lte.${in30d}&status=neq.done&order=deadline.asc`);\n\n// Calendar Events next 30 days\nconst events = await supaFetch(`calendar_events?event_date=gte.${scanDate}&event_date=lte.${in30d}&status=eq.upcoming&order=event_date.asc`);\n\n// Milestones\nconst milestones = await supaFetch('milestones?order=priority.asc');\n\n// Country Stability (latest)\nconst stability = await supaFetch('country_stability?order=scan_date.desc&limit=20');\n\n// Agent costs this month\nconst agentCosts = await supaFetch(`agent_logs?created_at=gte.${oneMonthAgo}&select=agent_name,cost_eur`);\nconst totalAgentCost = agentCosts.reduce((sum, a) => sum + (parseFloat(a.cost_eur) || 0), 0);\n\n// Latest scan results\nconst scanResults = await supaFetch('monthly_scan_results?order=scan_date.desc&limit=1');\n\n// FX rates\nconst fxRates = await supaFetch('fx_rates?order=scan_date.desc&limit=10');\n\n// Savings goals\nconst savingsGoals = await supaFetch('savings_goals?select=*');\n\n// Macro indicators\nconst macro = await supaFetch('macro_indicators?order=scan_date.desc&limit=1');\n\n// Exit prerequisites\nconst exitPrereqs = await supaFetch('exit_prerequisites?select=*');\nconst exitCompleted = exitPrereqs.filter(e => e.status === 'done').length;\nconst exitTotal = exitPrereqs.length;\nconst exitReadiness = exitTotal > 0 ? Math.round(exitCompleted / exitTotal * 100) : 0;\n\nreturn [{ json: {\n  scan_date: scanDate,\n  wealth: { current: currentWealth, history: snapshots },\n  budget,\n  holdings,\n  properties,\n  actions,\n  events,\n  milestones,\n  stability,\n  agent_cost_month: Math.round(totalAgentCost * 100) / 100,\n  scan_results: scanResults[0] || null,\n  fx_rates: fxRates,\n  savings_goals: savingsGoals,\n  macro: macro[0] || null,\n  exit_readiness: exitReadiness,\n  exit_completed: exitCompleted,\n  exit_total: exitTotal\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        400
+      ],
+      "id": "collect_data",
+      "name": "Step 1: Daten sammeln"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 2: Stress-Test Snapshot (Code Node, kein LLM)\nconst data = $input.first().json;\nconst holdings = data.holdings || [];\n\n// Calculate total portfolio value\nconst totalPortfolio = holdings.reduce((sum, h) => {\n  return sum + ((parseFloat(h.current_price) || 0) * (parseFloat(h.shares) || 0));\n}, 0);\n\n// Stress scenarios\nconst scenarios = {\n  'crash_2008': { equity: -0.50, bonds: -0.05, crypto: -0.80, gold: 0.25, real_estate: -0.20, label: '2008 Finanzkrise' },\n  'covid_2020': { equity: -0.34, bonds: 0.05, crypto: -0.50, gold: 0.10, real_estate: -0.05, label: 'COVID-19 Crash' }\n};\n\nconst stressResults = {};\nfor (const [key, scenario] of Object.entries(scenarios)) {\n  let stressedValue = 0;\n  for (const h of holdings) {\n    const value = (parseFloat(h.current_price) || 0) * (parseFloat(h.shares) || 0);\n    const type = (h.type || '').toLowerCase();\n    let factor = 0;\n    if (type.includes('aktie') || type.includes('etf') || type.includes('stock')) factor = scenario.equity;\n    else if (type.includes('anleihe') || type.includes('bond')) factor = scenario.bonds;\n    else if (type.includes('krypto') || type.includes('crypto')) factor = scenario.crypto;\n    else if (type.includes('gold') || type.includes('edelmetall')) factor = scenario.gold;\n    else factor = scenario.equity; // default to equity\n    stressedValue += value * (1 + factor);\n  }\n  stressResults[key] = {\n    label: scenario.label,\n    original: Math.round(totalPortfolio),\n    stressed: Math.round(stressedValue),\n    loss_pct: totalPortfolio > 0 ? Math.round((stressedValue - totalPortfolio) / totalPortfolio * 100) : 0\n  };\n}\n\nreturn [{ json: { ...data, stress_test: stressResults, total_portfolio: Math.round(totalPortfolio) } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        400
+      ],
+      "id": "stress_test",
+      "name": "Step 2: Stress-Test"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 3: Korrelations-Check (Klumpenrisiko)\nconst data = $input.first().json;\nconst holdings = data.holdings || [];\nconst properties = data.properties || [];\n\nconst totalPortfolio = data.total_portfolio || 0;\nconst totalPropertyValue = properties.reduce((sum, p) => sum + (parseFloat(p.current_value) || 0), 0);\nconst totalAssets = totalPortfolio + totalPropertyValue;\n\n// Currency concentration\nconst byCurrency = {};\nfor (const h of holdings) {\n  const cur = h.currency || 'EUR';\n  byCurrency[cur] = (byCurrency[cur] || 0) + ((parseFloat(h.current_price) || 0) * (parseFloat(h.shares) || 0));\n}\n// Properties are EUR\nbyCurrency['EUR'] = (byCurrency['EUR'] || 0) + totalPropertyValue;\n\nconst maxCurrencyPct = totalAssets > 0 ? Math.max(...Object.values(byCurrency)) / totalAssets * 100 : 0;\nconst maxCurrencyName = Object.entries(byCurrency).sort((a, b) => b[1] - a[1])[0]?.[0] || 'EUR';\n\n// Geography concentration\nconst byGeo = {};\nfor (const h of holdings) {\n  const dom = h.domicile || 'unknown';\n  byGeo[dom] = (byGeo[dom] || 0) + ((parseFloat(h.current_price) || 0) * (parseFloat(h.shares) || 0));\n}\nbyGeo['DE'] = (byGeo['DE'] || 0) + totalPropertyValue;\nconst maxGeoPct = totalAssets > 0 ? Math.max(...Object.values(byGeo)) / totalAssets * 100 : 0;\nconst maxGeoName = Object.entries(byGeo).sort((a, b) => b[1] - a[1])[0]?.[0] || 'DE';\n\n// Liquidity (illiquid = properties + locked assets)\nconst illiquidPct = totalAssets > 0 ? totalPropertyValue / totalAssets * 100 : 0;\n\nconst correlationScores = {\n  currency: { max_pct: Math.round(maxCurrencyPct), dominant: maxCurrencyName, flag: maxCurrencyPct > 60 },\n  geography: { max_pct: Math.round(maxGeoPct), dominant: maxGeoName, flag: maxGeoPct > 60 },\n  liquidity: { illiquid_pct: Math.round(illiquidPct), flag: illiquidPct > 60 }\n};\n\nreturn [{ json: { ...data, correlation_scores: correlationScores } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        400
+      ],
+      "id": "correlation_check",
+      "name": "Step 3: Korrelations-Check"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 4: Sonnet Call - Weekly Intelligence Brief\nconst data = $input.first().json;\n\nconst isFirstWeekOfMonth = new Date().getDate() <= 7;\nconst reportType = isFirstWeekOfMonth ? 'monthly' : 'weekly';\n\n// Build context for Sonnet\nconst context = {\n  scan_date: data.scan_date,\n  report_type: reportType,\n  wealth: data.wealth?.current || 'Keine Daten',\n  portfolio_total: data.total_portfolio,\n  properties: (data.properties || []).map(p => ({\n    name: p.name, equity: (parseFloat(p.current_value) || 0) - (parseFloat(p.loan_amount_current) || 0),\n    loan: p.loan_amount_current, value: p.current_value\n  })),\n  holdings_count: (data.holdings || []).length,\n  top_holdings: (data.holdings || []).sort((a, b) => ((parseFloat(b.current_price)||0)*(parseFloat(b.shares)||0)) - ((parseFloat(a.current_price)||0)*(parseFloat(a.shares)||0))).slice(0, 5).map(h => ({ name: h.name, value: Math.round((parseFloat(h.current_price)||0)*(parseFloat(h.shares)||0)) })),\n  stress_test: data.stress_test,\n  correlation_scores: data.correlation_scores,\n  alerts: data.scan_results?.alerts || [],\n  actions_pending: (data.actions || []).length,\n  events_upcoming: (data.events || []).length,\n  exit_readiness: data.exit_readiness,\n  agent_cost_month: data.agent_cost_month,\n  macro: data.macro,\n  fx_rates: (data.fx_rates || []).slice(0, 5)\n};\n\nconst systemPrompt = `Du bist der Personal CFO. Schreibe einen ${reportType === 'monthly' ? 'ausführlichen Monatsbericht' : 'wöchentlichen Portfolio-Narrativ'} in 4 Absätzen. Ton: Wie ein persönlicher CFO beim Frühstücks-Briefing — klar, direkt, keine unnötige Fachsprache.\n\nAbsatz 1 — WAS IST PASSIERT:\nNettovermögen, Haupttreiber, Immobilien-Equity durch Tilgung.\n\nAbsatz 2 — KONTEXT:\nPortfolio-Performance vs. Zielrendite. Klumpenrisiko-Status. OSINT: Zielländer stabil/Veränderung. Stress-Test Ergebnis.\n\nAbsatz 3 — HANDLUNGSBEDARF:\n1-3 priorisierte Aktionen. Fristen die anstehen.\n\nAbsatz 4 — AUSBLICK:\nExit-Readiness. Nächste Meilensteine. GeoArbitrage-Roadmap Status.\n\nAntworte auf Deutsch. Maximal 800 Wörter.`;\n\ntry {\n  const resp = await fetch('https://api.anthropic.com/v1/messages', {\n    method: 'POST',\n    headers: {\n      'Content-Type': 'application/json',\n      'x-api-key': $env.ANTHROPIC_API_KEY,\n      'anthropic-version': '2023-06-01'\n    },\n    body: JSON.stringify({\n      model: $env.MODEL_SONNET || 'claude-sonnet-4-6',\n      max_tokens: 1500,\n      system: systemPrompt,\n      messages: [{ role: 'user', content: JSON.stringify(context) }]\n    }),\n    signal: AbortSignal.timeout(60000)\n  });\n  const result = await resp.json();\n  const narrative = result.content?.[0]?.text || 'Report konnte nicht erstellt werden.';\n  const tokens_in = result.usage?.input_tokens || 0;\n  const tokens_out = result.usage?.output_tokens || 0;\n\n  return [{ json: { ...data, narrative, report_type: reportType, tokens_in, tokens_out } }];\n} catch (e) {\n  return [{ json: { ...data, narrative: `Fehler bei Report-Erstellung: ${e.message}`, report_type: reportType, tokens_in: 0, tokens_out: 0 } }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        980,
+        400
+      ],
+      "id": "sonnet_report",
+      "name": "Step 4: Sonnet Brief"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 5+6: Save to Supabase + Prepare Telegram\nconst data = $input.first().json;\n\n// Save full report to monthly_reports\nconst reportRow = {\n  scan_date: data.scan_date,\n  report_type: data.report_type,\n  narrative: data.narrative,\n  stress_test_results: data.stress_test || {},\n  correlation_scores: data.correlation_scores || {},\n  actions: (data.actions || []).map(a => ({ title: a.title, deadline: a.deadline })),\n  countries_scanned: data.scan_results?.countries_scanned || [],\n  alerts_triggered: data.scan_results?.alerts || [],\n  cost_eur: 0,\n  delivery_status: 'delivered'\n};\n\nawait fetch(`${$env.SUPABASE_URL}/rest/v1/monthly_reports`, {\n  method: 'POST',\n  headers: {\n    'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n    'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n    'Content-Type': 'application/json',\n    'Prefer': 'return=minimal'\n  },\n  body: JSON.stringify(reportRow),\n  signal: AbortSignal.timeout(10000)\n});\n\n// Telegram short version (max 500 chars)\nlet telegramText = data.narrative || '';\n// Extract first paragraph\nconst firstParagraph = telegramText.split('\\n\\n')[0] || telegramText;\nlet shortMessage = firstParagraph.substring(0, 450);\nif (shortMessage.length < firstParagraph.length) shortMessage += '...';\nshortMessage += '\\n\\n📊 Vollständiger Brief im Dashboard';\n\nreturn [{ json: {\n  message: shortMessage,\n  urgency: 'green',\n  category: 'weekly_report'\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1220,
+        400
+      ],
+      "id": "save_and_telegram",
+      "name": "Step 5+6: Speichern + Telegram"
+    },
+    {
+      "parameters": {
+        "workflowId": "SendAlert01",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1460,
+        400
+      ],
+      "id": "send_report_alert",
+      "name": "Send Alert ausführen"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log the report generation\nconst data = $('Step 4: Sonnet Brief').first().json;\nreturn [{ json: {\n  session_id: `weekly_report_${data.scan_date}`,\n  agent_name: 'weekly_report',\n  model: $env.MODEL_SONNET || 'claude-sonnet-4-6',\n  input_summary: `Weekly Report ${data.scan_date}`,\n  output_summary: `${data.report_type} report generated, ${data.narrative?.length || 0} chars`,\n  tokens_in: data.tokens_in || 0,\n  tokens_out: data.tokens_out || 0\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1460,
+        600
+      ],
+      "id": "prepare_report_log",
+      "name": "Log-Daten vorbereiten"
+    },
+    {
+      "parameters": {
+        "workflowId": "SqxGbsNqoNfioAcC",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1700,
+        600
+      ],
+      "id": "log_report",
+      "name": "Agent Logger ausführen",
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Step 1: Daten sammeln",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Step 1: Daten sammeln": {
+      "main": [
+        [
+          {
+            "node": "Step 2: Stress-Test",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Step 2: Stress-Test": {
+      "main": [
+        [
+          {
+            "node": "Step 3: Korrelations-Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Step 3: Korrelations-Check": {
+      "main": [
+        [
+          {
+            "node": "Step 4: Sonnet Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Step 4: Sonnet Brief": {
+      "main": [
+        [
+          {
+            "node": "Step 5+6: Speichern + Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Step 5+6: Speichern + Telegram": {
+      "main": [
+        [
+          {
+            "node": "Send Alert ausführen",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log-Daten vorbereiten",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log-Daten vorbereiten": {
+      "main": [
+        [
+          {
+            "node": "Agent Logger ausführen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

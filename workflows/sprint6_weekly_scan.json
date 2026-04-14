@@ -1,0 +1,744 @@
+{
+  "id": "WeeklyScan01",
+  "name": "Weekly Scan",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        600
+      ],
+      "id": "cron_trigger",
+      "name": "Montags 08:00 CET"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Timing Guards: Monat/Quartal bestimmen\nconst today = new Date();\nconst isFirstWeekOfMonth = today.getDate() <= 7;\nconst isFirstWeekOfQuarter = isFirstWeekOfMonth && [0,3,6,9].includes(today.getMonth());\nconst year = today.getFullYear();\nconst month = today.getMonth() + 1;\nconst kw = Math.ceil((((today - new Date(year,0,1)) / 86400000) + new Date(year,0,1).getDay() + 1) / 7);\nconst scanDate = today.toISOString().split('T')[0];\n\nreturn [{ json: {\n  scan_date: scanDate,\n  year,\n  month,\n  kw,\n  run_monthly_updates: isFirstWeekOfMonth,\n  run_quarterly_valuation: isFirstWeekOfQuarter,\n  run_quarterly_col: isFirstWeekOfQuarter\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        600
+      ],
+      "id": "timing_guard",
+      "name": "Timing Guards"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/target_countries?status=eq.active&order=priority.asc",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "alwaysOutputData": true
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        600
+      ],
+      "id": "load_countries",
+      "name": "Supabase: Target Countries laden",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare country list + always include Germany as reference\nconst timing = $('Timing Guards').first().json;\nconst countriesRaw = $('Supabase: Target Countries laden').first().json;\nconst countries = Array.isArray(countriesRaw) ? countriesRaw : (countriesRaw && countriesRaw.id ? [countriesRaw] : []);\n\n// Always add Germany as reference\nconst hasGermany = countries.some(c => c.country_code === 'GM');\nconst allCountries = hasGermany ? countries : [...countries, {\n  country_code: 'GM', country_name: 'Deutschland', iso_code: 'DE',\n  acled_name: 'Germany', role: 'aktuell', priority: 1, status: 'active'\n}];\n\nconst hasActiveCountries = countries.length > 0;\n\nreturn [{ json: {\n  ...timing,\n  countries: allCountries,\n  country_codes_fips: allCountries.map(c => c.country_code),\n  country_names_acled: allCountries.filter(c => c.acled_name).map(c => c.acled_name),\n  has_active_countries: hasActiveCountries\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        600
+      ],
+      "id": "prepare_countries",
+      "name": "Länderliste vorbereiten"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A1: GDELT Stability via v2 DOC API (TimelineTone + TimelineVol)\n// Replaces broken v1 dash_stabilitytimeline (404 since 2026)\nconst ctx = $('Länderliste vorbereiten').first().json;\nconst results = [];\n\nfor (const code of ctx.country_codes_fips) {\n  if (!/^[A-Z]{2}$/.test(code)) {\n    results.push({ country_code: code, error: 'Invalid FIPS code', instability_current: null });\n    continue;\n  }\n\n  try {\n    // GDELT v2 DOC API: TimelineTone (avg tone over time)\n    const toneUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=sourcecountry:${code}&mode=TimelineTone&TIMESPAN=60d&OUTPUT=csv`;\n    const toneResp = await fetch(toneUrl, { signal: AbortSignal.timeout(15000) });\n    const toneCsv = await toneResp.text();\n\n    // GDELT v2 DOC API: TimelineVol (article volume over time)\n    const volUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=sourcecountry:${code}&mode=TimelineVol&TIMESPAN=60d&OUTPUT=csv`;\n    const volResp = await fetch(volUrl, { signal: AbortSignal.timeout(15000) });\n    const volCsv = await volResp.text();\n\n    const parseCSV = (csv) => {\n      const lines = csv.trim().split('\\n').filter(l => l.trim());\n      if (lines.length < 2) return { current: null, previous: null };\n      const vals = lines.slice(1).map(l => {\n        const parts = l.split(',');\n        return { date: parts[0], value: parseFloat(parts[1]) };\n      }).filter(v => !isNaN(v.value));\n      if (vals.length === 0) return { current: null, previous: null };\n      const mid = Math.floor(vals.length / 2);\n      const recent = vals.slice(mid);\n      const earlier = vals.slice(0, mid);\n      const avgRecent = recent.reduce((s, v) => s + v.value, 0) / recent.length;\n      const avgEarlier = earlier.length > 0 ? earlier.reduce((s, v) => s + v.value, 0) / earlier.length : avgRecent;\n      return { current: avgRecent, previous: avgEarlier };\n    };\n\n    const tone = parseCSV(toneCsv);\n    const vol = parseCSV(volCsv);\n\n    // Negative tone = instability proxy. Volume spike = attention proxy.\n    const toneTrend = tone.previous !== 0 ? ((tone.current - tone.previous) / Math.abs(tone.previous) * 100) : 0;\n    const volTrend = vol.previous > 0 ? ((vol.current - vol.previous) / vol.previous * 100) : 0;\n\n    // Instability score: lower tone + higher volume = more unstable\n    const instability = tone.current !== null ? Math.max(0, -tone.current * 10 + Math.max(0, volTrend) * 0.5) : null;\n    const prevInstability = tone.previous !== null ? Math.max(0, -tone.previous * 10 + 0) : instability;\n    const instTrend = prevInstability > 0 ? ((instability - prevInstability) / prevInstability * 100) : 0;\n\n    let alarm = 'green';\n    if (instTrend > 50 || toneTrend < -50) alarm = 'red';\n    else if (instTrend > 20 || toneTrend < -30 || volTrend > 100) alarm = 'yellow';\n\n    results.push({\n      country_code: code,\n      instability_current: Math.round((instability || 0) * 100) / 100,\n      instability_previous: Math.round((prevInstability || 0) * 100) / 100,\n      instability_trend: Math.round(instTrend * 100) / 100,\n      tone_current: Math.round((tone.current || 0) * 100) / 100,\n      tone_previous: Math.round((tone.previous || 0) * 100) / 100,\n      tone_trend: Math.round(toneTrend * 100) / 100,\n      volume_trend: Math.round(volTrend * 100) / 100,\n      alarm,\n      source: 'gdelt_v2_doc'\n    });\n  } catch (e) {\n    results.push({ country_code: code, error: e.message, alarm: 'yellow' });\n  }\n}\n\nreturn [{ json: { gdelt_stability: results } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        0
+      ],
+      "id": "a1_gdelt_stability",
+      "name": "A1: GDELT Stability"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A2: GDELT News Volume - Spike Detection per country\nconst ctx = $('Länderliste vorbereiten').first().json;\nconst results = [];\n\nfor (const code of ctx.country_codes_fips) {\n  if (!/^[A-Z]{2}$/.test(code)) continue;\n  try {\n    const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=sourcecountry:${code}&mode=TimelineVol&TIMESPAN=30d&OUTPUT=csv`;\n    const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });\n    const csv = await resp.text();\n    const lines = csv.trim().split('\\n').filter(l => l.trim());\n    if (lines.length < 3) {\n      results.push({ country_code: code, spike_detected: false, spike_date: null, spike_magnitude: 0 });\n      continue;\n    }\n    const vals = lines.slice(1).map(l => {\n      const parts = l.split(',');\n      return { date: parts[0], volume: parseFloat(parts[1]) || 0 };\n    });\n    const mean = vals.reduce((s, v) => s + v.volume, 0) / vals.length;\n    const stdDev = Math.sqrt(vals.reduce((s, v) => s + Math.pow(v.volume - mean, 2), 0) / vals.length);\n    const spikes = vals.filter(v => stdDev > 0 && (v.volume - mean) / stdDev > 2);\n    const biggestSpike = spikes.sort((a, b) => b.volume - a.volume)[0];\n\n    results.push({\n      country_code: code,\n      spike_detected: spikes.length > 0,\n      spike_date: biggestSpike ? biggestSpike.date : null,\n      spike_magnitude: biggestSpike ? Math.round((biggestSpike.volume - mean) / stdDev * 100) / 100 : 0\n    });\n  } catch (e) {\n    results.push({ country_code: code, spike_detected: false, error: e.message });\n  }\n}\n\nreturn [{ json: { gdelt_news: results } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        200
+      ],
+      "id": "a2_gdelt_news",
+      "name": "A2: GDELT News Volume"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A3: ACLED Conflict Data per country (OAuth2 Token Flow)\nconst ctx = $('Länderliste vorbereiten').first().json;\nconst results = [];\n\n// Check if ACLED credentials are configured\nconst acledEmail = $env.ACLED_EMAIL || '';\nconst acledPassword = $env.ACLED_PASSWORD || '';\n\nif (!acledEmail || !acledPassword) {\n  return [{ json: { acled: [{ error: 'ACLED credentials not configured (ACLED_EMAIL/ACLED_PASSWORD missing)', skipped: true }] } }];\n}\n\ntry {\n  // Step 1: Get OAuth2 token\n  const tokenResp = await fetch('https://acleddata.com/oauth/token', {\n    method: 'POST',\n    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },\n    body: `username=${encodeURIComponent(acledEmail)}&password=${encodeURIComponent(acledPassword)}&grant_type=password&client_id=acled`,\n    signal: AbortSignal.timeout(15000)\n  });\n  const tokenData = await tokenResp.json();\n  if (!tokenData.access_token) {\n    return [{ json: { acled: [{ error: 'ACLED OAuth2 failed: ' + JSON.stringify(tokenData), skipped: true }] } }];\n  }\n\n  const token = tokenData.access_token;\n  const endDate = new Date().toISOString().split('T')[0];\n  const startDate = new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];\n  const prevStartDate = new Date(Date.now() - 60 * 86400000).toISOString().split('T')[0];\n\n  // Step 2: Fetch data per country\n  for (const country of ctx.countries) {\n    const acledName = country.acled_name;\n    if (!acledName) {\n      results.push({ country_code: country.country_code, skipped: true, reason: 'no acled_name' });\n      continue;\n    }\n    try {\n      // Current month\n      const resp = await fetch(\n        `https://acleddata.com/api/acled/read?event_date=${startDate}|${endDate}&event_date_where=BETWEEN&country=${encodeURIComponent(acledName)}&limit=500`,\n        { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15000) }\n      );\n      const data = await resp.json();\n      const events = data.data || [];\n\n      // Previous month\n      const prevResp = await fetch(\n        `https://acleddata.com/api/acled/read?event_date=${prevStartDate}|${startDate}&event_date_where=BETWEEN&country=${encodeURIComponent(acledName)}&limit=500`,\n        { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15000) }\n      );\n      const prevData = await prevResp.json();\n      const prevEvents = prevData.data || [];\n\n      const count = (arr, type) => arr.filter(e => e.event_type === type).length;\n      const protests = count(events, 'Protests');\n      const riots = count(events, 'Riots');\n      const violence = count(events, 'Violence against civilians');\n      const strategic = count(events, 'Strategic developments');\n\n      let alarm = 'green';\n      if (riots > 0 || violence > 0) alarm = 'red';\n      else if (protests > 5) alarm = 'yellow';\n\n      results.push({\n        country_code: country.country_code,\n        country_name: acledName,\n        total_events: events.length,\n        protests, riots, violence, strategic_developments: strategic,\n        prev_total: prevEvents.length,\n        trend_vs_previous: events.length - prevEvents.length,\n        alarm\n      });\n    } catch (e) {\n      results.push({ country_code: country.country_code, error: e.message });\n    }\n  }\n} catch (e) {\n  return [{ json: { acled: [{ error: 'ACLED token fetch failed: ' + e.message }] } }];\n}\n\nreturn [{ json: { acled: results } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        400
+      ],
+      "id": "a3_acled",
+      "name": "A3: ACLED Conflict Data"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A4: Polymarket Geopolitical Prediction Markets (mit Datum-Filter)\ntry {\n  const resp = await fetch('https://gamma-api.polymarket.com/markets?tag=geopolitics&active=true&limit=100', {\n    signal: AbortSignal.timeout(15000)\n  });\n  const markets = await resp.json();\n  const ctx = $('Länderliste vorbereiten').first().json;\n  const countryNames = ctx.countries.map(c => c.country_name.toLowerCase());\n  const keywords = [...countryNames, 'eu', 'europe', 'germany', 'uae', 'war', 'conflict', 'sanctions', 'tax', 'regulation'];\n\n  // Datum-Filter: nur Markets die noch nicht abgelaufen sind (Learning #6-2)\n  const now = new Date();\n  const sixMonthsAgo = new Date(now.getTime() - 180 * 86400000);\n\n  const relevant = (Array.isArray(markets) ? markets : []).filter(m => {\n    // Filter out old/expired markets\n    if (m.endDate) {\n      const endDate = new Date(m.endDate);\n      if (endDate < now) return false; // already ended\n    }\n    if (m.createdAt) {\n      const createdAt = new Date(m.createdAt);\n      if (createdAt < sixMonthsAgo && !m.endDate) return false; // old without end date\n    }\n    const title = (m.question || m.title || '').toLowerCase();\n    return keywords.some(kw => title.includes(kw));\n  }).map(m => ({\n    title: m.question || m.title,\n    probability: m.outcomePrices ? parseFloat(JSON.parse(m.outcomePrices)[0]) : null,\n    volume: m.volume || 0,\n    end_date: m.endDate || null,\n    created_at: m.createdAt || null\n  })).sort((a, b) => (b.volume || 0) - (a.volume || 0)).slice(0, 20);\n\n  return [{ json: { polymarket: relevant } }];\n} catch (e) {\n  return [{ json: { polymarket: [], error: e.message } }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        600
+      ],
+      "id": "a4_polymarket",
+      "name": "A4: Polymarket"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A5: Immobilien Equity Update (nur 1. Woche des Monats)\nconst ctx = $('Länderliste vorbereiten').first().json;\nif (!ctx.run_monthly_updates) {\n  return [{ json: { properties_update: [], skipped: true, reason: 'Not first week of month' } }];\n}\n\n// Load properties from Supabase\ntry {\n  const resp = await fetch(\n    `${$env.SUPABASE_URL}/rest/v1/properties?status=eq.active&select=*`,\n    {\n      headers: {\n        'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n        'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`\n      },\n      signal: AbortSignal.timeout(15000)\n    }\n  );\n  const properties = await resp.json();\n  if (!Array.isArray(properties) || properties.length === 0) {\n    return [{ json: { properties_update: [], skipped: true, reason: 'No active properties' } }];\n  }\n\n  const results = [];\n  const alerts = [];\n\n  for (const prop of properties) {\n    // a) Restschuld update (Annuitätenlogik)\n    const loanCurrent = parseFloat(prop.loan_amount_current) || 0;\n    const loanRate = parseFloat(prop.loan_rate) || 0; // as percentage e.g. 1.8\n    const monthlyPayment = parseFloat(prop.loan_monthly_payment) || 0;\n\n    let newLoanCurrent = loanCurrent;\n    let monatlicher_zins = 0;\n    let monatliche_tilgung = 0;\n\n    if (loanCurrent > 0 && monthlyPayment > 0) {\n      monatlicher_zins = loanCurrent * (loanRate / 100) / 12;\n      monatliche_tilgung = monthlyPayment - monatlicher_zins;\n      newLoanCurrent = loanCurrent - monatliche_tilgung;\n    }\n\n    // c) Equity\n    const currentValue = parseFloat(prop.current_value) || 0;\n    const equity = currentValue - newLoanCurrent;\n\n    // d) Cashflow\n    const rentGross = parseFloat(prop.monthly_rent_gross) || 0;\n    const hausgeld = parseFloat(prop.monthly_hausgeld) || 0;\n    const nichtUmlagefaehig = parseFloat(prop.monthly_nicht_umlagefaehig) || 0;\n    const verwaltung = parseFloat(prop.monthly_verwaltung) || 0;\n\n    const cashflow_vor_steuer = rentGross - hausgeld - nichtUmlagefaehig - verwaltung - monatlicher_zins;\n    const cashflow_nach_tilgung = cashflow_vor_steuer - monatliche_tilgung;\n    const vermoegenszuwachs = monatliche_tilgung + cashflow_vor_steuer;\n\n    // Update Supabase\n    if (loanCurrent > 0 && monthlyPayment > 0) {\n      await fetch(\n        `${$env.SUPABASE_URL}/rest/v1/properties?id=eq.${prop.id}`,\n        {\n          method: 'PATCH',\n          headers: {\n            'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n            'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n            'Content-Type': 'application/json',\n            'Prefer': 'return=minimal'\n          },\n          body: JSON.stringify({ loan_amount_current: Math.round(newLoanCurrent * 100) / 100 }),\n          signal: AbortSignal.timeout(10000)\n        }\n      );\n    }\n\n    // e) Zinsbindung alert\n    if (prop.loan_zinsbindung_end) {\n      const zinsEnd = new Date(prop.loan_zinsbindung_end);\n      const monthsLeft = (zinsEnd - new Date()) / (30 * 86400000);\n      if (monthsLeft < 24 && monthsLeft > 0) {\n        alerts.push({\n          type: 'zinsbindung',\n          message: `⚠️ Zinsbindung für ${prop.name} läuft am ${prop.loan_zinsbindung_end} aus (${Math.round(monthsLeft)} Monate). Anschlussfinanzierung verhandeln!`,\n          urgency: 'yellow'\n        });\n      }\n    }\n\n    results.push({\n      id: prop.id,\n      name: prop.name,\n      loan_old: loanCurrent,\n      loan_new: Math.round(newLoanCurrent * 100) / 100,\n      tilgung: Math.round(monatliche_tilgung * 100) / 100,\n      zins: Math.round(monatlicher_zins * 100) / 100,\n      equity: Math.round(equity * 100) / 100,\n      cashflow_vor_steuer: Math.round(cashflow_vor_steuer * 100) / 100,\n      cashflow_nach_tilgung: Math.round(cashflow_nach_tilgung * 100) / 100,\n      vermoegenszuwachs: Math.round(vermoegenszuwachs * 100) / 100\n    });\n  }\n\n  return [{ json: { properties_update: results, alerts } }];\n} catch (e) {\n  return [{ json: { properties_update: [], error: e.message } }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        800
+      ],
+      "id": "a5_immobilien",
+      "name": "A5: Immobilien Equity"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A6: Kurs-Update (Yahoo Finance + Twelvedata Fallback + CoinGecko)\nconst results = { stocks: [], crypto: [], alerts: [] };\n\ntry {\n  // Load portfolio holdings\n  const resp = await fetch(\n    `${$env.SUPABASE_URL}/rest/v1/portfolio_holdings?select=*`,\n    {\n      headers: {\n        'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n        'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`\n      },\n      signal: AbortSignal.timeout(10000)\n    }\n  );\n  const holdings = await resp.json();\n  if (!Array.isArray(holdings) || holdings.length === 0) {\n    return [{ json: { kurs_update: results, skipped: true, reason: 'No holdings' } }];\n  }\n\n  const stockHoldings = holdings.filter(h => h.ticker && h.type !== 'Krypto' && h.type !== 'Edelmetall');\n  const cryptoHoldings = holdings.filter(h => h.type === 'Krypto');\n\n  // Stock/ETF prices via Yahoo Finance with Twelvedata fallback\n  for (const h of stockHoldings) {\n    let price = null;\n    let source = null;\n    try {\n      // Yahoo Finance primary\n      const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(h.ticker)}?interval=1d&range=5d`;\n      const yahooResp = await fetch(yahooUrl, { signal: AbortSignal.timeout(10000) });\n      if (yahooResp.ok) {\n        const yahooData = await yahooResp.json();\n        const closes = yahooData?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];\n        const validCloses = closes.filter(c => c !== null);\n        if (validCloses.length > 0) {\n          price = validCloses[validCloses.length - 1];\n          source = 'yahoo';\n        }\n      }\n    } catch (e) { /* Yahoo failed, try fallback */ }\n\n    // Twelvedata fallback\n    if (price === null && $env.TWELVEDATA_API_KEY) {\n      try {\n        const tdUrl = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(h.ticker)}&apikey=${$env.TWELVEDATA_API_KEY}`;\n        const tdResp = await fetch(tdUrl, { signal: AbortSignal.timeout(10000) });\n        const tdData = await tdResp.json();\n        if (tdData.price) {\n          price = parseFloat(tdData.price);\n          source = 'twelvedata';\n        }\n      } catch (e) { /* Twelvedata also failed */ }\n    }\n\n    if (price !== null) {\n      // Update Supabase\n      await fetch(\n        `${$env.SUPABASE_URL}/rest/v1/portfolio_holdings?id=eq.${h.id}`,\n        {\n          method: 'PATCH',\n          headers: {\n            'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n            'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n            'Content-Type': 'application/json',\n            'Prefer': 'return=minimal'\n          },\n          body: JSON.stringify({\n            current_price: Math.round(price * 100) / 100,\n            last_price_update: new Date().toISOString().split('T')[0]\n          }),\n          signal: AbortSignal.timeout(10000)\n        }\n      );\n      results.stocks.push({ ticker: h.ticker, name: h.name, price, source });\n    } else {\n      results.alerts.push({ message: `⚠️ Kurs für ${h.ticker} nicht abrufbar`, urgency: 'yellow' });\n    }\n  }\n\n  // Crypto via CoinGecko\n  if (cryptoHoldings.length > 0) {\n    try {\n      const ids = cryptoHoldings.map(h => (h.ticker || h.name || '').toLowerCase()).join(',');\n      const cgHeaders = { 'Accept': 'application/json' };\n      if ($env.COINGECKO_API_KEY) {\n        cgHeaders['x-cg-demo-api-key'] = $env.COINGECKO_API_KEY;\n      }\n      const cgResp = await fetch(\n        `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=eur`,\n        { headers: cgHeaders, signal: AbortSignal.timeout(10000) }\n      );\n      const cgData = await cgResp.json();\n      for (const h of cryptoHoldings) {\n        const key = (h.ticker || h.name || '').toLowerCase();\n        if (cgData[key] && cgData[key].eur) {\n          const price = cgData[key].eur;\n          await fetch(\n            `${$env.SUPABASE_URL}/rest/v1/portfolio_holdings?id=eq.${h.id}`,\n            {\n              method: 'PATCH',\n              headers: {\n                'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n                'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n                'Content-Type': 'application/json',\n                'Prefer': 'return=minimal'\n              },\n              body: JSON.stringify({ current_price: price, last_price_update: new Date().toISOString().split('T')[0] }),\n              signal: AbortSignal.timeout(10000)\n            }\n          );\n          results.crypto.push({ id: key, name: h.name, price, source: 'coingecko' });\n        }\n      }\n    } catch (e) {\n      results.alerts.push({ message: '⚠️ CoinGecko API nicht erreichbar', urgency: 'yellow' });\n    }\n  }\n\n  // Check Haltefristen in portfolio_lots\n  try {\n    const lotsResp = await fetch(\n      `${$env.SUPABASE_URL}/rest/v1/portfolio_lots?status=eq.held&select=*,portfolio_holdings(name,ticker)`,\n      {\n        headers: {\n          'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n          'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`\n        },\n        signal: AbortSignal.timeout(10000)\n      }\n    );\n    const lots = await lotsResp.json();\n    if (Array.isArray(lots)) {\n      const now = new Date();\n      for (const lot of lots) {\n        if (lot.tax_free_after) {\n          const tfDate = new Date(lot.tax_free_after);\n          if (tfDate <= now) {\n            results.alerts.push({\n              message: `✅ Position ${lot.portfolio_holdings?.name || 'Unbekannt'} (Lot ${lot.purchase_date}) ist jetzt steuerfrei!`,\n              urgency: 'green'\n            });\n          } else if (tfDate <= new Date(now.getTime() + 30 * 86400000)) {\n            results.alerts.push({\n              message: `⚠️ Position ${lot.portfolio_holdings?.name || 'Unbekannt'} wird in ${Math.ceil((tfDate - now) / 86400000)} Tagen steuerfrei`,\n              urgency: 'yellow'\n            });\n          }\n        }\n      }\n    }\n  } catch (e) { /* lots check failed, not critical */ }\n\n} catch (e) {\n  return [{ json: { kurs_update: results, error: e.message } }];\n}\n\nreturn [{ json: { kurs_update: results } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        1000
+      ],
+      "id": "a6_kurs_update",
+      "name": "A6: Kurs-Update"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A7: Wechselkurs-Update (ExchangeRate-API)\nconst ctx = $('Länderliste vorbereiten').first().json;\ntry {\n  const resp = await fetch('https://open.er-api.com/v6/latest/EUR', { signal: AbortSignal.timeout(10000) });\n  const data = await resp.json();\n  if (data.result !== 'success') {\n    return [{ json: { fx_rates: [], error: 'ExchangeRate API error' } }];\n  }\n\n  const rates = data.rates;\n  // Get currencies for target countries + USD + CHF\n  const targetCurrencies = ['USD', 'CHF'];\n  // Map known country currencies\n  const currencyMap = { 'AE': 'AED', 'CY': 'EUR', 'PO': 'EUR', 'MT': 'EUR', 'SN': 'SGD', 'GM': 'EUR', 'GG': 'GEL', 'PA': 'PYG', 'UK': 'GBP' };\n  for (const c of ctx.countries) {\n    const cur = currencyMap[c.country_code];\n    if (cur && !targetCurrencies.includes(cur) && cur !== 'EUR') {\n      targetCurrencies.push(cur);\n    }\n  }\n\n  const scanDate = ctx.scan_date;\n  const results = [];\n  const alerts = [];\n\n  // Load previous rates for trend\n  const prevResp = await fetch(\n    `${$env.SUPABASE_URL}/rest/v1/fx_rates?order=scan_date.desc&limit=${targetCurrencies.length}&scan_date=neq.${scanDate}`,\n    {\n      headers: {\n        'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n        'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`\n      },\n      signal: AbortSignal.timeout(10000)\n    }\n  );\n  const prevRates = await prevResp.json();\n  const prevMap = {};\n  if (Array.isArray(prevRates)) {\n    for (const r of prevRates) {\n      if (!prevMap[r.target_currency]) prevMap[r.target_currency] = r.rate;\n    }\n  }\n\n  for (const cur of targetCurrencies) {\n    if (!rates[cur]) continue;\n    const rate = rates[cur];\n    const prevRate = prevMap[cur] ? parseFloat(prevMap[cur]) : null;\n    const change = prevRate ? ((rate - prevRate) / prevRate * 100) : null;\n\n    results.push({\n      scan_date: scanDate,\n      base_currency: 'EUR',\n      target_currency: cur,\n      rate: Math.round(rate * 10000) / 10000,\n      change_vs_last_month: change ? Math.round(change * 100) / 100 : null\n    });\n\n    if (change && Math.abs(change) > 5) {\n      alerts.push({\n        message: `🟡 Wechselkurs EUR/${cur} hat sich um ${change > 0 ? '+' : ''}${Math.round(change * 10) / 10}% verändert`,\n        urgency: 'yellow'\n      });\n    }\n  }\n\n  // Insert into Supabase\n  if (results.length > 0) {\n    await fetch(\n      `${$env.SUPABASE_URL}/rest/v1/fx_rates`,\n      {\n        method: 'POST',\n        headers: {\n          'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n          'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n          'Content-Type': 'application/json',\n          'Prefer': 'return=minimal'\n        },\n        body: JSON.stringify(results),\n        signal: AbortSignal.timeout(10000)\n      }\n    );\n  }\n\n  return [{ json: { fx_rates: results, alerts } }];\n} catch (e) {\n  return [{ json: { fx_rates: [], error: e.message } }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        1200
+      ],
+      "id": "a7_wechselkurs",
+      "name": "A7: Wechselkurs-Update"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A9: Inflations-Monitor (World Bank API)\nconst ctx = $('Länderliste vorbereiten').first().json;\nconst results = [];\nconst alerts = [];\n\n// Map FIPS to ISO codes for World Bank\nconst fipsToIso = { 'GM': 'DE', 'AE': 'AE', 'CY': 'CY', 'PO': 'PT', 'MT': 'MT', 'SN': 'SG', 'GG': 'GE', 'PA': 'PY', 'UK': 'GB' };\n\nfor (const country of ctx.countries) {\n  const iso = country.iso_code || fipsToIso[country.country_code];\n  if (!iso) continue;\n  try {\n    const url = `https://api.worldbank.org/v2/country/${iso}/indicator/FP.CPI.TOTL.ZG?format=json&per_page=3&mrv=2`;\n    const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });\n    const data = await resp.json();\n    if (data && data[1] && data[1].length > 0) {\n      const latest = data[1][0];\n      const rate = latest.value;\n      const prev = data[1].length > 1 ? data[1][1].value : null;\n      let trend = 'stabil';\n      if (rate && prev) {\n        if (rate > prev + 1) trend = 'steigend';\n        else if (rate < prev - 1) trend = 'fallend';\n      }\n\n      results.push({\n        country_code: country.country_code,\n        data_date: latest.date + '-01-01',\n        inflation_rate_official: rate ? Math.round(rate * 100) / 100 : null,\n        inflation_trend: trend,\n        source: 'worldbank'\n      });\n\n      if (rate && rate > 10) {\n        alerts.push({\n          message: `⚠️ Inflation in ${country.country_name} bei ${Math.round(rate * 10) / 10}% — Kaufkraft-Erosion berücksichtigen`,\n          urgency: 'yellow'\n        });\n      }\n    }\n  } catch (e) { /* skip this country */ }\n}\n\n// Insert into Supabase\nif (results.length > 0) {\n  await fetch(\n    `${$env.SUPABASE_URL}/rest/v1/country_inflation`,\n    {\n      method: 'POST',\n      headers: {\n        'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n        'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n        'Content-Type': 'application/json',\n        'Prefer': 'return=minimal'\n      },\n      body: JSON.stringify(results),\n      signal: AbortSignal.timeout(10000)\n    }\n  );\n}\n\nreturn [{ json: { inflation: results, alerts } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        1400
+      ],
+      "id": "a9_inflation",
+      "name": "A9: Inflations-Monitor"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A12: Gold-Preis-Update\nconst ctx = $('Länderliste vorbereiten').first().json;\nlet goldPriceUsd = null;\nlet goldSource = null;\nlet goldHistory = [];\n\ntry {\n  // Primary: Yahoo Finance GC=F (Gold Futures)\n  const yahooUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1d&range=90d';\n  const yahooResp = await fetch(yahooUrl, { signal: AbortSignal.timeout(10000) });\n  if (yahooResp.ok) {\n    const data = await yahooResp.json();\n    const closes = data?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];\n    goldHistory = closes.filter(c => c !== null);\n    if (goldHistory.length > 0) {\n      goldPriceUsd = goldHistory[goldHistory.length - 1];\n      goldSource = 'yahoo_gc_f';\n    }\n  }\n} catch (e) { /* Yahoo failed */ }\n\n// Fallback: Twelvedata\nif (goldPriceUsd === null && $env.TWELVEDATA_API_KEY) {\n  try {\n    const tdResp = await fetch(\n      `https://api.twelvedata.com/price?symbol=XAU/USD&apikey=${$env.TWELVEDATA_API_KEY}`,\n      { signal: AbortSignal.timeout(10000) }\n    );\n    const tdData = await tdResp.json();\n    if (tdData.price) {\n      goldPriceUsd = parseFloat(tdData.price);\n      goldSource = 'twelvedata_xauusd';\n    }\n  } catch (e) { /* Twelvedata also failed */ }\n}\n\nif (goldPriceUsd === null) {\n  return [{ json: { gold: null, error: 'Gold price unavailable from all sources', alerts: [{ message: '⚠️ Goldpreis nicht abrufbar', urgency: 'yellow' }] } }];\n}\n\n// EUR conversion from fx_rates\nlet eurUsdRate = 1.08; // fallback\ntry {\n  const fxResp = await fetch(\n    `${$env.SUPABASE_URL}/rest/v1/fx_rates?target_currency=eq.USD&order=scan_date.desc&limit=1`,\n    {\n      headers: {\n        'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n        'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`\n      },\n      signal: AbortSignal.timeout(5000)\n    }\n  );\n  const fxData = await fxResp.json();\n  if (Array.isArray(fxData) && fxData.length > 0) {\n    eurUsdRate = parseFloat(fxData[0].rate);\n  }\n} catch (e) { /* use fallback */ }\n\nconst goldPriceEur = goldPriceUsd / eurUsdRate;\n\n// Calculate changes\nconst change = (current, history, daysBack) => {\n  if (history.length < daysBack) return null;\n  const old = history[history.length - daysBack];\n  return old > 0 ? ((current - old) / old * 100) : null;\n};\n\nconst change1w = change(goldPriceUsd, goldHistory, 5) || 0;\nconst change1m = change(goldPriceUsd, goldHistory, 22) || 0;\nconst change3m = change(goldPriceUsd, goldHistory, 65) || 0;\n\nlet goldTrend = 'stabil';\nif (change1m > 2) goldTrend = 'steigend';\nelse if (change1m < -2) goldTrend = 'fallend';\n\nconst alerts = [];\nif (change1w > 10) alerts.push({ message: `🔴 Gold +${Math.round(change1w * 10) / 10}% in 7 Tagen — starker Inflations-/Krisenindikator`, urgency: 'red' });\nelse if (change1w > 5) alerts.push({ message: `🟡 Gold +${Math.round(change1w * 10) / 10}% in 7 Tagen — mögliches Krisensignal`, urgency: 'yellow' });\nelse if (change1w < -5) alerts.push({ message: `🟡 Gold ${Math.round(change1w * 10) / 10}% — Risk-On Marktphase`, urgency: 'yellow' });\n\nconst goldData = {\n  scan_date: ctx.scan_date,\n  gold_price_usd: Math.round(goldPriceUsd * 100) / 100,\n  gold_price_eur: Math.round(goldPriceEur * 100) / 100,\n  gold_change_1w: Math.round(change1w * 100) / 100,\n  gold_change_1m: Math.round(change1m * 100) / 100,\n  gold_change_3m: Math.round(change3m * 100) / 100,\n  gold_trend: goldTrend,\n  gold_source: goldSource\n};\n\nreturn [{ json: { gold: goldData, alerts } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        1600
+      ],
+      "id": "a12_gold",
+      "name": "A12: Gold-Preis"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A13: EZB-Leitzins-Update\nconst ctx = $('Länderliste vorbereiten').first().json;\nconst alerts = [];\n\nconst fetchECB = async (seriesId) => {\n  try {\n    const url = `https://data-api.ecb.europa.eu/service/data/FM/${seriesId}?format=jsondata&lastNObservations=10`;\n    const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });\n    const data = await resp.json();\n    const seriesKey = Object.keys(data.dataSets[0].series)[0];\n    const observations = data.dataSets[0].series[seriesKey].observations;\n    const sortedKeys = Object.keys(observations).sort();\n    if (sortedKeys.length < 2) return { current: null, previous: null, changed: false };\n    const lastKey = sortedKeys[sortedKeys.length - 1];\n    const prevKey = sortedKeys[sortedKeys.length - 2];\n    const currentRate = observations[lastKey][0];\n    const prevRate = observations[prevKey][0];\n    return { current: currentRate, previous: prevRate, changed: currentRate !== prevRate, changeBp: Math.round((currentRate - prevRate) * 100) };\n  } catch (e) {\n    return { current: null, error: e.message };\n  }\n};\n\nconst deposit = await fetchECB('B.U2.EUR.4F.KR.DFR.LEV');\nconst mainRate = await fetchECB('B.U2.EUR.4F.KR.MRR_FR.LEV');\nconst marginal = await fetchECB('B.U2.EUR.4F.KR.MLF.LEV');\n\n// Next ECB meeting\nconst ecbMeetings = ['2026-01-30','2026-03-06','2026-04-17','2026-06-05','2026-07-24','2026-09-11','2026-10-30','2026-12-18'];\nconst nextMeeting = ecbMeetings.find(d => new Date(d) > new Date()) || 'Kalender-Update nötig';\nconst daysToMeeting = nextMeeting && nextMeeting.includes('-') ? Math.ceil((new Date(nextMeeting) - new Date()) / 86400000) : null;\n\nif (deposit.changed) {\n  alerts.push({\n    message: `🔴 EZB ändert Leitzins: ${deposit.previous}% → ${deposit.current}% (${deposit.changeBp > 0 ? '+' : ''}${deposit.changeBp}bp). Immobilien-Finanzierung und Portfolio-Strategie anpassen!`,\n    urgency: 'red'\n  });\n}\nif (daysToMeeting && daysToMeeting <= 14) {\n  alerts.push({\n    message: `🟡 EZB-Ratssitzung in ${daysToMeeting} Tagen (${nextMeeting}). Zinsänderung möglich.`,\n    urgency: 'yellow'\n  });\n}\n\nconst ecbData = {\n  scan_date: ctx.scan_date,\n  ecb_deposit_rate: deposit.current,\n  ecb_main_rate: mainRate.current,\n  ecb_marginal_rate: marginal.current,\n  ecb_rate_changed: deposit.changed || false,\n  ecb_change_basis_points: deposit.changeBp || 0,\n  ecb_next_meeting_date: nextMeeting.includes('-') ? nextMeeting : null,\n  ecb_source: 'ecb_api'\n};\n\nreturn [{ json: { ecb: ecbData, alerts } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        1800
+      ],
+      "id": "a13_ecb",
+      "name": "A13: EZB-Leitzins"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A10: Market Intelligence Scan (Tavily Web Search)\nconst ctx = $('Länderliste vorbereiten').first().json;\nconst results = [];\n\nconst searches = [\n  { query: `unusual options activity ${ctx.year} week ${ctx.kw}`, source: 'unusual_whales' },\n  { query: `macro market outlook ${ctx.year} week ${ctx.kw}`, source: 'macro_outlook' },\n  { query: `crypto whale alert ${ctx.year} week ${ctx.kw}`, source: 'crypto_whales' }\n];\n\nfor (const s of searches) {\n  try {\n    const resp = await fetch('https://api.tavily.com/search', {\n      method: 'POST',\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({\n        api_key: $env.TAVILY_API_KEY,\n        query: s.query,\n        max_results: 3,\n        search_depth: 'basic'\n      }),\n      signal: AbortSignal.timeout(15000)\n    });\n    const data = await resp.json();\n    if (data.results) {\n      for (const r of data.results) {\n        results.push({\n          scan_date: ctx.scan_date,\n          source: s.source,\n          headline: (r.title || '').substring(0, 200),\n          snippet: (r.content || '').substring(0, 500),\n          relevance_tags: [s.source]\n        });\n      }\n    }\n  } catch (e) { /* skip this search */ }\n}\n\n// Insert into Supabase\nif (results.length > 0) {\n  await fetch(\n    `${$env.SUPABASE_URL}/rest/v1/market_intelligence`,\n    {\n      method: 'POST',\n      headers: {\n        'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n        'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n        'Content-Type': 'application/json',\n        'Prefer': 'return=minimal'\n      },\n      body: JSON.stringify(results),\n      signal: AbortSignal.timeout(10000)\n    }\n  );\n}\n\nreturn [{ json: { market_intelligence: results } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        2000
+      ],
+      "id": "a10_market_intel",
+      "name": "A10: Market Intelligence"
+    },
+    {
+      "parameters": {
+        "jsCode": "// A11: Fristen-Check (erweitert)\nconst ctx = $('Länderliste vorbereiten').first().json;\nconst alerts = [];\nconst now = new Date();\nconst in30d = new Date(now.getTime() + 30 * 86400000).toISOString().split('T')[0];\nconst in12m = new Date(now.getTime() + 365 * 86400000).toISOString().split('T')[0];\nconst today = now.toISOString().split('T')[0];\n\nconst supaFetch = async (path) => {\n  const resp = await fetch(`${$env.SUPABASE_URL}/rest/v1/${path}`, {\n    headers: {\n      'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n      'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`\n    },\n    signal: AbortSignal.timeout(10000)\n  });\n  return resp.json();\n};\n\n// Calendar events next 30 days\ntry {\n  const events = await supaFetch(`calendar_events?event_date=gte.${today}&event_date=lte.${in30d}&status=eq.upcoming&order=event_date.asc`);\n  if (Array.isArray(events)) {\n    for (const e of events) {\n      const daysLeft = Math.ceil((new Date(e.event_date) - now) / 86400000);\n      const prefix = e.source === 'google_calendar' ? '📱' : '📅';\n      alerts.push({ message: `${prefix} ${e.title} am ${e.event_date} (${daysLeft} Tage)`, urgency: daysLeft <= 7 ? 'yellow' : 'green', category: 'frist' });\n    }\n  }\n} catch (e) { /* skip */ }\n\n// Overdue actions\ntry {\n  const actions = await supaFetch(`actions?deadline=lt.${today}&status=neq.done&order=deadline.asc`);\n  if (Array.isArray(actions)) {\n    for (const a of actions) {\n      alerts.push({ message: `🔴 ÜBERFÄLLIG: ${a.title || a.description} (Deadline: ${a.deadline})`, urgency: 'red', category: 'overdue' });\n    }\n  }\n} catch (e) { /* skip */ }\n\n// Residence 183-day check\ntry {\n  const residence = await supaFetch('residence_summary?select=*&limit=1');\n  if (Array.isArray(residence) && residence.length > 0) {\n    const r = residence[0];\n    if (r.days_in_germany && parseInt(r.days_in_germany) > 150) {\n      alerts.push({ message: `⚠️ 183-Tage-Regel: Bereits ${r.days_in_germany} Tage in DE — Limit nähert sich!`, urgency: 'red', category: '183days' });\n    }\n  }\n} catch (e) { /* skip */ }\n\n// Properties speculation deadlines within 12 months\ntry {\n  const props = await supaFetch(`properties?speculation_end=lte.${in12m}&speculation_end=gte.${today}&status=eq.active`);\n  if (Array.isArray(props)) {\n    for (const p of props) {\n      const monthsLeft = Math.ceil((new Date(p.speculation_end) - now) / (30 * 86400000));\n      alerts.push({ message: `🏠 Spekulationsfrist für ${p.name} endet am ${p.speculation_end} (${monthsLeft} Monate)`, urgency: monthsLeft <= 3 ? 'yellow' : 'green', category: 'speculation' });\n    }\n  }\n} catch (e) { /* skip */ }\n\n// Portfolio lots tax-free in 30 days\ntry {\n  const lots = await supaFetch(`portfolio_lots?tax_free_after=lte.${in30d}&tax_free_after=gte.${today}&status=eq.held`);\n  if (Array.isArray(lots)) {\n    for (const l of lots) {\n      alerts.push({ message: `📈 Lot vom ${l.purchase_date} wird am ${l.tax_free_after} steuerfrei`, urgency: 'green', category: 'haltefrist' });\n    }\n  }\n} catch (e) { /* skip */ }\n\nreturn [{ json: { fristen: alerts } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        2200
+      ],
+      "id": "a11_fristen",
+      "name": "A11: Fristen-Check"
+    },
+    {
+      "parameters": {
+        "jsCode": "// B1-B4: Tavily Web Search (Steuerrecht, Immigration, Immobilien, Wirtschaft)\nconst ctx = $('Länderliste vorbereiten').first().json;\nconst year = ctx.year;\nconst results = { steuerrecht: [], immigration: [], immobilien: [], wirtschaft: [] };\n\nconst tavilySearch = async (query) => {\n  try {\n    const resp = await fetch('https://api.tavily.com/search', {\n      method: 'POST',\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({\n        api_key: $env.TAVILY_API_KEY,\n        query,\n        max_results: 3,\n        search_depth: 'basic'\n      }),\n      signal: AbortSignal.timeout(15000)\n    });\n    const data = await resp.json();\n    return (data.results || []).map(r => ({ title: r.title, url: r.url, snippet: (r.content || '').substring(0, 300) }));\n  } catch (e) { return []; }\n};\n\n// B1: Steuerrecht\nconst taxQueries = [`AStG Änderung ${year}`, `Wegzugsbesteuerung Änderung ${year}`, `Grunderwerbsteuer NRW Änderung ${year}`];\nfor (const q of taxQueries) {\n  const r = await tavilySearch(q);\n  results.steuerrecht.push(...r);\n}\n\n// B2: Immigration (per target country with immigration role)\nconst immigrationCountries = ctx.countries.filter(c => c.role && (c.role.includes('residenz') || c.role.includes('staatsbuergerschaft')));\nfor (const c of immigrationCountries) {\n  const r = await tavilySearch(`${c.country_name} residency visa changes ${year}`);\n  results.immigration.push(...r);\n}\nconst genericImm = await tavilySearch(`golden visa Europe changes ${year}`);\nresults.immigration.push(...genericImm);\n\n// B3: Immobilien\nconst immoResults = await tavilySearch(`Germany real estate market ${year} outlook`);\nresults.immobilien.push(...immoResults);\n\n// B4: Wirtschaft\nconst econResults = await tavilySearch(`Germany economy outlook ${year}`);\nresults.wirtschaft.push(...econResults);\nfor (const c of ctx.countries.filter(c => c.priority <= 2 && c.country_code !== 'GM')) {\n  const r = await tavilySearch(`${c.country_name} economy outlook ${year}`);\n  results.wirtschaft.push(...r);\n}\n\nreturn [{ json: { web_search: results } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        2400
+      ],
+      "id": "b_web_search",
+      "name": "B1-B4: Web Search (Tavily)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate all scan results + detect alarms\nconst ctx = $('Länderliste vorbereiten').first().json;\n\n// Collect all results\nconst gdeltStab = $('A1: GDELT Stability').first().json;\nconst gdeltNews = $('A2: GDELT News Volume').first().json;\nconst acled = $('A3: ACLED Conflict Data').first().json;\nconst polymarket = $('A4: Polymarket').first().json;\nconst immobilien = $('A5: Immobilien Equity').first().json;\nconst kurse = $('A6: Kurs-Update').first().json;\nconst fx = $('A7: Wechselkurs-Update').first().json;\nconst inflation = $('A9: Inflations-Monitor').first().json;\nconst gold = $('A12: Gold-Preis').first().json;\nconst ecb = $('A13: EZB-Leitzins').first().json;\nconst marketIntel = $('A10: Market Intelligence').first().json;\nconst fristen = $('A11: Fristen-Check').first().json;\nconst webSearch = $('B1-B4: Web Search (Tavily)').first().json;\n\n// Collect all alerts\nconst allAlerts = [];\n\n// GDELT stability alarms\nif (gdeltStab.gdelt_stability) {\n  for (const g of gdeltStab.gdelt_stability) {\n    if (g.alarm === 'red') allAlerts.push({ message: `🔴 GDELT Instabilität ${g.country_code}: +${g.instability_trend}% vs Vormonat`, urgency: 'red', source: 'gdelt' });\n    else if (g.alarm === 'yellow') allAlerts.push({ message: `🟡 GDELT Warnung ${g.country_code}: Instabilität +${g.instability_trend}%`, urgency: 'yellow', source: 'gdelt' });\n  }\n}\n\n// GDELT news spikes\nif (gdeltNews.gdelt_news) {\n  for (const n of gdeltNews.gdelt_news) {\n    if (n.spike_detected) allAlerts.push({ message: `🟡 Nachrichten-Spike ${n.country_code} am ${n.spike_date} (${n.spike_magnitude}σ)`, urgency: 'yellow', source: 'gdelt_news' });\n  }\n}\n\n// ACLED alarms\nif (acled.acled) {\n  for (const a of acled.acled) {\n    if (a.alarm === 'red') allAlerts.push({ message: `🔴 ${a.country_name}: ${a.riots} Riots, ${a.violence} Violence-Events`, urgency: 'red', source: 'acled' });\n    else if (a.alarm === 'yellow') allAlerts.push({ message: `🟡 ${a.country_name}: ${a.protests} Proteste`, urgency: 'yellow', source: 'acled' });\n  }\n}\n\n// Property alerts\nif (immobilien.alerts) allAlerts.push(...immobilien.alerts);\n\n// Kurs alerts\nif (kurse.kurs_update?.alerts) allAlerts.push(...kurse.kurs_update.alerts);\n\n// FX alerts\nif (fx.alerts) allAlerts.push(...fx.alerts);\n\n// Inflation alerts\nif (inflation.alerts) allAlerts.push(...inflation.alerts);\n\n// Gold alerts\nif (gold.alerts) allAlerts.push(...gold.alerts);\n\n// ECB alerts\nif (ecb.alerts) allAlerts.push(...ecb.alerts);\n\n// Fristen alerts (only red/yellow)\nif (fristen.fristen) {\n  allAlerts.push(...fristen.fristen.filter(f => f.urgency !== 'green'));\n}\n\nconst hasOsintAlarms = allAlerts.some(a => a.urgency === 'red' && ['gdelt', 'gdelt_news', 'acled'].includes(a.source));\nconst hasRelevantSearchResults = (webSearch.web_search?.steuerrecht?.length || 0) + (webSearch.web_search?.immigration?.length || 0) > 0;\n\n// Save country_stability to Supabase\nif (gdeltStab.gdelt_stability) {\n  const stabilityRows = gdeltStab.gdelt_stability.filter(g => !g.error).map(g => {\n    const newsData = gdeltNews.gdelt_news?.find(n => n.country_code === g.country_code);\n    const acledData = acled.acled?.find(a => a.country_code === g.country_code);\n    return {\n      scan_date: ctx.scan_date,\n      country_code: g.country_code,\n      country_name: ctx.countries.find(c => c.country_code === g.country_code)?.country_name || g.country_code,\n      gdelt_instability: g.instability_current,\n      gdelt_instability_trend: g.instability_trend,\n      gdelt_tone: g.tone_current,\n      gdelt_tone_trend: g.tone_trend,\n      gdelt_news_spike: newsData?.spike_detected || false,\n      acled_total_events: acledData?.total_events || 0,\n      acled_protests: acledData?.protests || 0,\n      acled_riots: acledData?.riots || 0,\n      acled_violence: acledData?.violence || 0,\n      polymarket_relevant: polymarket.polymarket?.slice(0, 5) || [],\n      overall_status: g.alarm\n    };\n  });\n  if (stabilityRows.length > 0) {\n    await fetch(`${$env.SUPABASE_URL}/rest/v1/country_stability`, {\n      method: 'POST',\n      headers: {\n        'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n        'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n        'Content-Type': 'application/json',\n        'Prefer': 'return=minimal'\n      },\n      body: JSON.stringify(stabilityRows),\n      signal: AbortSignal.timeout(10000)\n    });\n  }\n}\n\n// Save macro_indicators (gold + ecb combined)\nconst macroRow = {\n  scan_date: ctx.scan_date,\n  ...(gold.gold || {}),\n  ...(ecb.ecb || {})\n};\ndelete macroRow.scan_date_duplicate;\nawait fetch(`${$env.SUPABASE_URL}/rest/v1/macro_indicators`, {\n  method: 'POST',\n  headers: {\n    'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n    'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n    'Content-Type': 'application/json',\n    'Prefer': 'return=minimal'\n  },\n  body: JSON.stringify({ scan_date: ctx.scan_date, ...gold.gold, ...ecb.ecb }),\n  signal: AbortSignal.timeout(10000)\n});\n\n// Save monthly_scan_results\nconst scanResult = {\n  scan_date: ctx.scan_date,\n  raw_data: { gdelt: gdeltStab, gdelt_news: gdeltNews, acled, polymarket, immobilien, kurse, fx, inflation, gold, ecb, marketIntel, fristen, webSearch },\n  alerts: allAlerts,\n  changes_detected: allAlerts.some(a => a.urgency === 'red'),\n  countries_scanned: ctx.country_codes_fips,\n  cost_eur: 0.10 // estimated Tavily cost\n};\nawait fetch(`${$env.SUPABASE_URL}/rest/v1/monthly_scan_results`, {\n  method: 'POST',\n  headers: {\n    'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n    'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n    'Content-Type': 'application/json',\n    'Prefer': 'return=minimal'\n  },\n  body: JSON.stringify(scanResult),\n  signal: AbortSignal.timeout(10000)\n});\n\nreturn [{ json: {\n  scan_date: ctx.scan_date,\n  kw: ctx.kw,\n  countries_scanned: ctx.country_codes_fips,\n  total_alerts: allAlerts.length,\n  red_alerts: allAlerts.filter(a => a.urgency === 'red').length,\n  yellow_alerts: allAlerts.filter(a => a.urgency === 'yellow').length,\n  all_alerts: allAlerts,\n  has_osint_alarms: hasOsintAlarms,\n  has_relevant_search: hasRelevantSearchResults,\n  raw_data_summary: {\n    gdelt_countries: gdeltStab.gdelt_stability?.length || 0,\n    acled_countries: acled.acled?.length || 0,\n    polymarket_markets: polymarket.polymarket?.length || 0,\n    fx_currencies: fx.fx_rates?.length || 0,\n    gold_price: gold.gold?.gold_price_eur || null,\n    ecb_deposit: ecb.ecb?.ecb_deposit_rate || null,\n    web_search_results: Object.values(webSearch.web_search || {}).flat().length,\n    fristen_count: fristen.fristen?.length || 0\n  }\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        1100
+      ],
+      "id": "aggregate",
+      "name": "Ergebnisse aggregieren"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "alarm_check",
+              "leftValue": "={{ $json.has_osint_alarms }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        900
+      ],
+      "id": "if_osint_alarm",
+      "name": "OSINT Alarme?"
+    },
+    {
+      "parameters": {
+        "jsCode": "// C1: OSINT Anomalie-Bewertung (Haiku - nur bei Alarm)\nconst ctx = $input.first().json;\nconst alarmedData = ctx.all_alerts.filter(a => ['gdelt', 'gdelt_news', 'acled'].includes(a.source));\n\nif (alarmedData.length === 0) {\n  return [{ json: { c1_assessment: null, skipped: true } }];\n}\n\nconst prompt = `Analysiere die folgenden Instabilitäts- und Konfliktdaten für die Zielländer des Mandanten. Gibt es besorgniserregende Trends? Kontext: Der Mandant plant mittelfristig die Verlagerung seines Lebensmittelpunkts in eines dieser Länder.\\n\\nAlarme:\\n${alarmedData.map(a => a.message).join('\\n')}\\n\\nAntworte auf Deutsch in JSON: {\"assessment\": \"...\", \"urgency\": \"high|medium|low\", \"affected_countries\": [...], \"recommendation\": \"...\"}`;\n\ntry {\n  const resp = await fetch('https://api.anthropic.com/v1/messages', {\n    method: 'POST',\n    headers: {\n      'Content-Type': 'application/json',\n      'x-api-key': $env.ANTHROPIC_API_KEY,\n      'anthropic-version': '2023-06-01'\n    },\n    body: JSON.stringify({\n      model: $env.MODEL_HAIKU || 'claude-haiku-4-5-20251001',\n      max_tokens: 500,\n      messages: [{ role: 'user', content: prompt }]\n    }),\n    signal: AbortSignal.timeout(30000)\n  });\n  const data = await resp.json();\n  const text = data.content?.[0]?.text || '';\n  let parsed;\n  try { parsed = JSON.parse(text); } catch { parsed = { assessment: text, urgency: 'medium' }; }\n  return [{ json: { c1_assessment: parsed, tokens_in: data.usage?.input_tokens || 0, tokens_out: data.usage?.output_tokens || 0 } }];\n} catch (e) {\n  return [{ json: { c1_assessment: null, error: e.message } }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        800
+      ],
+      "id": "c1_osint_assessment",
+      "name": "C1: OSINT Bewertung (Haiku)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// No OSINT alarms - pass through\nreturn [{ json: { c1_assessment: null, skipped: true } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        1000
+      ],
+      "id": "c1_skip",
+      "name": "C1: Kein Alarm"
+    },
+    {
+      "parameters": {
+        "jsCode": "// C2: Rechtsänderungs-Bewertung (Haiku - nur wenn relevante Treffer)\nconst agg = $('Ergebnisse aggregieren').first().json;\nconst hasSearch = agg.has_relevant_search;\n\nif (!hasSearch) {\n  return [{ json: { c2_assessment: null, skipped: true } }];\n}\n\n// Get web search results from scan_results\nconst scanResp = await fetch(\n  `${$env.SUPABASE_URL}/rest/v1/monthly_scan_results?scan_date=eq.${agg.scan_date}&order=created_at.desc&limit=1`,\n  {\n    headers: {\n      'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n      'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`\n    },\n    signal: AbortSignal.timeout(10000)\n  }\n);\nconst scanData = await scanResp.json();\nconst rawData = Array.isArray(scanData) && scanData[0] ? scanData[0].raw_data : {};\nconst webSearch = rawData.webSearch?.web_search || {};\n\nconst searchSummary = Object.entries(webSearch).map(([cat, results]) => {\n  if (!Array.isArray(results) || results.length === 0) return '';\n  return `${cat}:\\n${results.map(r => `- ${r.title}: ${r.snippet}`).join('\\n')}`;\n}).filter(s => s).join('\\n\\n');\n\nif (!searchSummary) {\n  return [{ json: { c2_assessment: null, skipped: true } }];\n}\n\nconst prompt = `Gibt es relevante Rechtsänderungen für einen Mandanten der: aus DE wegziehen will, Immobilien in DE hält, eine zweite Staatsbürgerschaft anstrebt?\\n\\nSuchergebnisse:\\n${searchSummary.substring(0, 2000)}\\n\\nAntworte auf Deutsch in JSON: {\"changes_detected\": true/false, \"summary\": \"...\", \"affected_agents\": [...], \"urgency\": \"high|medium|low\"}`;\n\ntry {\n  const resp = await fetch('https://api.anthropic.com/v1/messages', {\n    method: 'POST',\n    headers: {\n      'Content-Type': 'application/json',\n      'x-api-key': $env.ANTHROPIC_API_KEY,\n      'anthropic-version': '2023-06-01'\n    },\n    body: JSON.stringify({\n      model: $env.MODEL_HAIKU || 'claude-haiku-4-5-20251001',\n      max_tokens: 500,\n      messages: [{ role: 'user', content: prompt }]\n    }),\n    signal: AbortSignal.timeout(30000)\n  });\n  const data = await resp.json();\n  const text = data.content?.[0]?.text || '';\n  let parsed;\n  try { parsed = JSON.parse(text); } catch { parsed = { changes_detected: false, summary: text }; }\n  return [{ json: { c2_assessment: parsed, tokens_in: data.usage?.input_tokens || 0, tokens_out: data.usage?.output_tokens || 0 } }];\n} catch (e) {\n  return [{ json: { c2_assessment: null, error: e.message } }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        1200
+      ],
+      "id": "c2_legal_assessment",
+      "name": "C2: Rechtsänderung (Haiku)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Telegram Delivery: Compose and send scan summary\nconst agg = $('Ergebnisse aggregieren').first().json;\n\n// Get C1 and C2 assessments\nlet c1 = null;\ntry { c1 = $('C1: OSINT Bewertung (Haiku)').first().json.c1_assessment; } catch {}\ntry { if (!c1) c1 = $('C1: Kein Alarm').first().json.c1_assessment; } catch {}\n\nlet c2 = null;\ntry { c2 = $('C2: Rechtsänderung (Haiku)').first().json.c2_assessment; } catch {}\n\nlet message;\nif (agg.red_alerts === 0 && agg.yellow_alerts <= 2) {\n  // All clear\n  message = `🟢 *Weekly Scan KW${agg.kw}*\\n\\nKeine relevanten Änderungen.`;\n  if (agg.raw_data_summary.gold_price) {\n    message += `\\n\\n💰 Gold: ${agg.raw_data_summary.gold_price}€`;\n  }\n  if (agg.raw_data_summary.ecb_deposit) {\n    message += `\\n🏦 EZB: ${agg.raw_data_summary.ecb_deposit}%`;\n  }\n  message += `\\n\\n${agg.raw_data_summary.gdelt_countries} Länder gescannt, ${agg.raw_data_summary.web_search_results} Web-Treffer.\\n📊 Details im Dashboard`;\n} else {\n  // Alerts present\n  message = `⚠️ *Weekly Scan KW${agg.kw}*\\n\\n`;\n  message += `${agg.red_alerts} 🔴 | ${agg.yellow_alerts} 🟡\\n\\n`;\n\n  // Top 5 alerts\n  const topAlerts = agg.all_alerts\n    .sort((a, b) => (a.urgency === 'red' ? 0 : 1) - (b.urgency === 'red' ? 0 : 1))\n    .slice(0, 5);\n  for (const a of topAlerts) {\n    message += `${a.message}\\n`;\n  }\n\n  if (c1 && c1.assessment) {\n    message += `\\n*OSINT:* ${c1.assessment.substring(0, 200)}`;\n  }\n  if (c2 && c2.changes_detected) {\n    message += `\\n*Recht:* ${c2.summary?.substring(0, 200) || 'Änderungen erkannt'}`;\n  }\n\n  message += `\\n\\n📊 Vollständiger Brief im Dashboard`;\n}\n\n// Truncate to Telegram limit\nif (message.length > 4000) message = message.substring(0, 3997) + '...';\n\nreturn [{ json: { message, urgency: agg.red_alerts > 0 ? 'red' : (agg.yellow_alerts > 0 ? 'yellow' : 'green'), category: 'weekly_scan' } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        1100
+      ],
+      "id": "delivery_format",
+      "name": "Telegram Message erstellen"
+    },
+    {
+      "parameters": {
+        "workflowId": "SendAlert01",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2280,
+        1100
+      ],
+      "id": "send_alert",
+      "name": "Send Alert ausführen"
+    },
+    {
+      "parameters": {
+        "workflowId": "SqxGbsNqoNfioAcC",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2500,
+        1100
+      ],
+      "id": "log_scan",
+      "name": "Agent Logger ausführen",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare logger input\nconst agg = $('Ergebnisse aggregieren').first().json;\nreturn [{ json: {\n  session_id: `weekly_scan_${agg.scan_date}`,\n  agent_name: 'weekly_scan',\n  model: 'none',\n  input_summary: `Weekly Scan KW${agg.kw}: ${agg.countries_scanned?.length || 0} Länder`,\n  output_summary: `${agg.total_alerts} Alerts (${agg.red_alerts}🔴 ${agg.yellow_alerts}🟡), ${agg.raw_data_summary.web_search_results} Web-Treffer`,\n  tokens_in: 0,\n  tokens_out: 0,\n  cost_eur: 0.10\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2280,
+        1300
+      ],
+      "id": "prepare_log",
+      "name": "Log-Daten vorbereiten"
+    }
+  ],
+  "connections": {
+    "Montags 08:00 CET": {
+      "main": [
+        [
+          {
+            "node": "Timing Guards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Timing Guards": {
+      "main": [
+        [
+          {
+            "node": "Supabase: Target Countries laden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase: Target Countries laden": {
+      "main": [
+        [
+          {
+            "node": "Länderliste vorbereiten",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Länderliste vorbereiten": {
+      "main": [
+        [
+          {
+            "node": "A1: GDELT Stability",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A2: GDELT News Volume",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A3: ACLED Conflict Data",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A4: Polymarket",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A5: Immobilien Equity",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A6: Kurs-Update",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A7: Wechselkurs-Update",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A9: Inflations-Monitor",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A12: Gold-Preis",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A13: EZB-Leitzins",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A10: Market Intelligence",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "A11: Fristen-Check",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "B1-B4: Web Search (Tavily)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A1: GDELT Stability": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A2: GDELT News Volume": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A3: ACLED Conflict Data": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A4: Polymarket": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A5: Immobilien Equity": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A6: Kurs-Update": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A7: Wechselkurs-Update": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A9: Inflations-Monitor": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A12: Gold-Preis": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A13: EZB-Leitzins": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A10: Market Intelligence": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A11: Fristen-Check": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "B1-B4: Web Search (Tavily)": {
+      "main": [
+        [
+          {
+            "node": "Ergebnisse aggregieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ergebnisse aggregieren": {
+      "main": [
+        [
+          {
+            "node": "OSINT Alarme?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "C2: Rechtsänderung (Haiku)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OSINT Alarme?": {
+      "main": [
+        [
+          {
+            "node": "C1: OSINT Bewertung (Haiku)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "C1: Kein Alarm",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "C1: OSINT Bewertung (Haiku)": {
+      "main": [
+        [
+          {
+            "node": "Telegram Message erstellen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "C1: Kein Alarm": {
+      "main": [
+        [
+          {
+            "node": "Telegram Message erstellen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "C2: Rechtsänderung (Haiku)": {
+      "main": [
+        [
+          {
+            "node": "Telegram Message erstellen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Message erstellen": {
+      "main": [
+        [
+          {
+            "node": "Send Alert ausführen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Alert ausführen": {
+      "main": [
+        [
+          {
+            "node": "Log-Daten vorbereiten",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log-Daten vorbereiten": {
+      "main": [
+        [
+          {
+            "node": "Agent Logger ausführen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

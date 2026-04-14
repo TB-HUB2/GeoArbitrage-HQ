@@ -1,0 +1,172 @@
+{
+  "name": "Quarterly Quality Check",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10 1-7 1,4,7,10 2"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        400
+      ],
+      "id": "cron_quarterly",
+      "name": "1. Dienstag Jan/Apr/Jul/Okt 10:00"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Determine current quarter\nconst now = new Date();\nconst quarter = Math.ceil((now.getMonth() + 1) / 3);\nconst year = now.getFullYear();\nconst qStart = new Date(year, (quarter - 1) * 3 - 3, 1).toISOString().split('T')[0]; // Previous quarter start\nconst qEnd = new Date(year, (quarter - 1) * 3, 0).toISOString().split('T')[0]; // Previous quarter end\n\nreturn [{ json: { quarter: `Q${quarter > 1 ? quarter - 1 : 4}`, year: quarter > 1 ? year : year - 1, q_start: qStart, q_end: qEnd } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        400
+      ],
+      "id": "calc_quarter",
+      "name": "Quartal berechnen"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 1: Agent Performance Data\nconst ctx = $input.first().json;\nconst supaFetch = async (path) => {\n  const resp = await fetch(`${$env.SUPABASE_URL}/rest/v1/${path}`, {\n    headers: { 'apikey': $env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}` },\n    signal: AbortSignal.timeout(10000)\n  });\n  return resp.json();\n};\n\n// Agent logs for last quarter\nconst logs = await supaFetch(`agent_logs?created_at=gte.${ctx.q_start}&created_at=lte.${ctx.q_end}T23:59:59&select=*`);\nconst logArr = Array.isArray(logs) ? logs : [];\n\n// Group by agent\nconst byAgent = {};\nfor (const log of logArr) {\n  const name = log.agent_name || 'unknown';\n  if (!byAgent[name]) byAgent[name] = { calls: 0, confidence_scores: [], validation: { pass: 0, correction: 0, fail: 0 }, escalated: 0, tokens: 0, cost: 0 };\n  byAgent[name].calls++;\n  if (log.confidence_score) byAgent[name].confidence_scores.push(log.confidence_score);\n  if (log.validation_status === 'pass') byAgent[name].validation.pass++;\n  else if (log.validation_status === 'correction') byAgent[name].validation.correction++;\n  else if (log.validation_status === 'fail') byAgent[name].validation.fail++;\n  if (log.escalated) byAgent[name].escalated++;\n  byAgent[name].tokens += (parseInt(log.tokens_in) || 0) + (parseInt(log.tokens_out) || 0);\n  byAgent[name].cost += parseFloat(log.cost_eur) || 0;\n}\n\nconst agentStats = Object.entries(byAgent).map(([name, stats]) => ({\n  agent: name,\n  calls: stats.calls,\n  avg_confidence: stats.confidence_scores.length > 0 ? stats.confidence_scores.filter(s => s === 'hoch').length / stats.confidence_scores.length : null,\n  pass_rate: stats.calls > 0 ? Math.round(stats.validation.pass / stats.calls * 100) : 0,\n  correction_rate: stats.calls > 0 ? Math.round(stats.validation.correction / stats.calls * 100) : 0,\n  fail_rate: stats.calls > 0 ? Math.round(stats.validation.fail / stats.calls * 100) : 0,\n  escalation_rate: stats.calls > 0 ? Math.round(stats.escalated / stats.calls * 100) : 0,\n  avg_tokens: stats.calls > 0 ? Math.round(stats.tokens / stats.calls) : 0,\n  total_cost: Math.round(stats.cost * 100) / 100\n}));\n\n// Step 2: User Feedback\nconst feedback = await supaFetch(`user_feedback?created_at=gte.${ctx.q_start}&created_at=lte.${ctx.q_end}T23:59:59&select=*`);\nconst fbArr = Array.isArray(feedback) ? feedback : [];\nconst fbByAgent = {};\nfor (const fb of fbArr) {\n  const name = fb.agent_name || 'unknown';\n  if (!fbByAgent[name]) fbByAgent[name] = { positive: 0, negative: 0, total: 0 };\n  fbByAgent[name].total++;\n  if (fb.rating === 'positive' || fb.rating === '👍') fbByAgent[name].positive++;\n  else fbByAgent[name].negative++;\n}\n\n// Step 3: Coverage Gaps\nconst gaps = await supaFetch(`coverage_gaps?created_at=gte.${ctx.q_start}&created_at=lte.${ctx.q_end}T23:59:59&select=*`);\nconst gapArr = Array.isArray(gaps) ? gaps : [];\nconst gapTopics = {};\nfor (const g of gapArr) {\n  const topic = g.topic || g.category || 'unknown';\n  gapTopics[topic] = (gapTopics[topic] || 0) + 1;\n}\nconst frequentGaps = Object.entries(gapTopics).filter(([_, count]) => count >= 3).map(([topic, count]) => ({ topic, count }));\n\n// Step 4: Knowledge Staleness\nconst staleThresholds = { tax: 180, immigration: 180, default: 365 };\nconst sixMonthsAgo = new Date(Date.now() - 180*86400000).toISOString();\nconst oneYearAgo = new Date(Date.now() - 365*86400000).toISOString();\nconst staleChunks = await supaFetch(`knowledge_base?updated_at=lt.${sixMonthsAgo}&select=id,category,title,updated_at&order=updated_at.asc&limit=20`);\nconst staleArr = Array.isArray(staleChunks) ? staleChunks : [];\n\nreturn [{ json: {\n  ...ctx,\n  agent_stats: agentStats,\n  feedback_by_agent: fbByAgent,\n  total_feedback: fbArr.length,\n  coverage_gaps_total: gapArr.length,\n  frequent_gaps: frequentGaps,\n  stale_chunks: staleArr.length,\n  stale_list: staleArr.slice(0, 10).map(c => `${c.category}/${c.title} (${c.updated_at?.split('T')[0]})`)\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        400
+      ],
+      "id": "collect_quality_data",
+      "name": "Daten sammeln"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 5: Telegram Report\nconst data = $input.first().json;\n\nlet msg = `📊 *Quarterly Quality Report ${data.quarter} ${data.year}*\\n\\n`;\n\n// Agent Stats\nif (data.agent_stats.length > 0) {\n  const sorted = [...data.agent_stats].sort((a, b) => b.calls - a.calls);\n  const topAgent = sorted[0];\n  msg += `*Agents:* ${sorted.length} aktiv, ${sorted.reduce((s, a) => s + a.calls, 0)} Calls total\\n`;\n  msg += `Top: ${topAgent.agent} (${topAgent.calls} Calls, ${topAgent.pass_rate}% Pass)\\n`;\n  const totalCost = sorted.reduce((s, a) => s + a.total_cost, 0);\n  msg += `Gesamtkosten: ${Math.round(totalCost * 100) / 100}€\\n\\n`;\n} else {\n  msg += `*Agents:* Keine Daten für dieses Quartal\\n\\n`;\n}\n\n// Feedback\nmsg += `*Feedback:* ${data.total_feedback} Bewertungen\\n`;\nfor (const [agent, fb] of Object.entries(data.feedback_by_agent)) {\n  const rate = fb.total > 0 ? Math.round(fb.positive / fb.total * 100) : 0;\n  msg += `  ${agent}: ${rate}% positiv (${fb.total})\\n`;\n}\nmsg += '\\n';\n\n// Coverage Gaps\nmsg += `*Coverage Gaps:* ${data.coverage_gaps_total} total\\n`;\nif (data.frequent_gaps.length > 0) {\n  msg += `Häufungen: ${data.frequent_gaps.map(g => `${g.topic} (${g.count}x)`).join(', ')}\\n`;\n}\nmsg += '\\n';\n\n// Stale Knowledge\nmsg += `*Veraltete Chunks:* ${data.stale_chunks}\\n`;\nif (data.stale_list.length > 0) {\n  msg += data.stale_list.slice(0, 5).map(s => `  - ${s}`).join('\\n') + '\\n';\n}\nmsg += '\\n→ Review im Dashboard, Prompt-Anpassungen manuell in knowledge\\\\_base/core-prompts/ vornehmen';\n\n// Truncate\nif (msg.length > 4000) msg = msg.substring(0, 3997) + '...';\n\nreturn [{ json: { message: msg, urgency: 'green', category: 'quarterly_quality' } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        400
+      ],
+      "id": "format_telegram",
+      "name": "Telegram Report"
+    },
+    {
+      "parameters": {
+        "workflowId": "SendAlert01",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1000,
+        400
+      ],
+      "id": "send_quality_alert",
+      "name": "Send Alert ausführen"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $('Daten sammeln').first().json;\nreturn [{ json: {\n  session_id: `quarterly_quality_${data.quarter}_${data.year}`,\n  agent_name: 'quarterly_quality',\n  model: 'none',\n  input_summary: `Quality Check ${data.quarter} ${data.year}`,\n  output_summary: `${data.agent_stats?.length || 0} Agents, ${data.coverage_gaps_total} Gaps, ${data.stale_chunks} stale`,\n  tokens_in: 0,\n  tokens_out: 0\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        600
+      ],
+      "id": "prepare_quality_log",
+      "name": "Log-Daten"
+    },
+    {
+      "parameters": {
+        "workflowId": "SqxGbsNqoNfioAcC",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1240,
+        600
+      ],
+      "id": "log_quality",
+      "name": "Agent Logger",
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "1. Dienstag Jan/Apr/Jul/Okt 10:00": {
+      "main": [
+        [
+          {
+            "node": "Quartal berechnen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Quartal berechnen": {
+      "main": [
+        [
+          {
+            "node": "Daten sammeln",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daten sammeln": {
+      "main": [
+        [
+          {
+            "node": "Telegram Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Report": {
+      "main": [
+        [
+          {
+            "node": "Send Alert ausführen",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log-Daten",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log-Daten": {
+      "main": [
+        [
+          {
+            "node": "Agent Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

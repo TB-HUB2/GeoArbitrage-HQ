@@ -1,0 +1,118 @@
+# ============================================================
+# GeoArbitrage HQ — Docker Compose
+# n8n + PostgreSQL + nginx Reverse Proxy
+#
+# Deployment:
+#   docker compose up -d
+#   docker compose logs -f n8n
+#
+# WICHTIG:
+# - NIEMALS docker compose restart! Laedt keine neuen env vars!
+# - IMMER docker compose up -d verwenden (recreate)
+# - Alle Images auf spezifische Version pinnen (NIEMALS :latest!)
+# ============================================================
+
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: n8n
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${DB_POSTGRESDB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - n8n-net
+    # NUR localhost — NICHT oeffentlich erreichbar
+    ports: []
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:2.14.1
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      # --- n8n Core ---
+      - N8N_HOST=${N8N_HOST}
+      - N8N_PORT=${N8N_PORT}
+      - N8N_PROTOCOL=${N8N_PROTOCOL}
+      - N8N_EDITOR_BASE_URL=${N8N_EDITOR_BASE_URL}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - NODES_EXCLUDE=[]
+      - N8N_DEFAULT_EXECUTION_TIMEOUT=-1
+      # --- PostgreSQL ---
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${DB_POSTGRESDB_PASSWORD}
+      # --- Supabase ---
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      # --- Anthropic ---
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - MODEL_SONNET=${MODEL_SONNET}
+      - MODEL_HAIKU=${MODEL_HAIKU}
+      # --- Voyage AI ---
+      - VOYAGE_API_KEY=${VOYAGE_API_KEY}
+      # --- Telegram ---
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_SECRET_TOKEN=${TELEGRAM_SECRET_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - TELEGRAM_ALLOWED_CHAT_ID=${TELEGRAM_ALLOWED_CHAT_ID}
+      # --- Google Calendar ---
+      - GOOGLE_CALENDAR_CLIENT_ID=${GOOGLE_CALENDAR_CLIENT_ID}
+      - GOOGLE_CALENDAR_CLIENT_SECRET=${GOOGLE_CALENDAR_CLIENT_SECRET}
+      # --- Tavily ---
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      # --- ACLED ---
+      - ACLED_USERNAME=${ACLED_USERNAME}
+      - ACLED_PASSWORD=${ACLED_PASSWORD}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - n8n-net
+    # NUR localhost — NICHT oeffentlich! Zugang ueber Tailscale VPN + nginx
+    ports:
+      - "127.0.0.1:5678:5678"
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - n8n
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      # SSL-Zertifikate (Tailscale oder Let's Encrypt)
+      # - /path/to/certs:/etc/nginx/certs:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - n8n-net
+
+volumes:
+  postgres_data:
+  n8n_data:
+
+networks:
+  n8n-net:
+
+# ============================================================
+# UPDATE-PROZEDUR (vor jedem Image-Update):
+# 1. Hetzner Snapshot erstellen (Console -> Server -> Snapshots)
+# 2. Backup ausfuehren: bash backup.sh
+# 3. Version in diesem File aendern (MIT PYTHON, kein sed!)
+# 4. docker compose pull n8n && docker compose up -d
+# 5. Healthcheck: curl http://localhost:5678/healthz
+# 6. Version pruefen: docker compose exec n8n n8n --version
+# 7. Altes Image entfernen: docker image rm <altes-image>
+# 8. Bei Problemen: docker compose down, alte Version, up -d
+#
+# Bei BSI/CERT-Warnungen (kritische CVEs): SOFORT patchen!
+# ============================================================

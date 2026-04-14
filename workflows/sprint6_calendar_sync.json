@@ -1,0 +1,160 @@
+{
+  "name": "Calendar Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0,6,12,18 * * *"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        400
+      ],
+      "id": "cron_calendar",
+      "name": "Alle 6 Stunden"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin={{ new Date().toISOString() }}&timeMax={{ new Date(Date.now() + 90*86400000).toISOString() }}&singleEvents=true&orderBy=startTime&maxResults=250",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "alwaysOutputData": true
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        400
+      ],
+      "id": "fetch_google_events",
+      "name": "Google Calendar Events laden",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 2: Kategorisiere Events (kein LLM)\nconst rawEvents = $input.first().json;\nconst items = rawEvents.items || [];\n\nif (items.length === 0) {\n  return [{ json: { events: [], count: 0 } }];\n}\n\nconst categorize = (title, description) => {\n  const text = ((title || '') + ' ' + (description || '')).toLowerCase();\n  if (/steuer|finanzamt|est|kst|ust|gewst/i.test(text)) return 'tax';\n  if (/notar|grundbuch|immobilie|makler/i.test(text)) return 'real_estate';\n  if (/visum|botschaft|aufenthalt|pass/i.test(text)) return 'immigration';\n  if (/berater|anwalt|versicherung/i.test(text)) return 'advisory';\n  if (/dba|compliance|audit/i.test(text)) return 'compliance';\n  return 'personal';\n};\n\nconst getEventType = (event, title) => {\n  if (event.recurrence || event.recurringEventId) return 'recurring';\n  if (/frist|deadline|ablauf/i.test(title || '')) return 'deadline';\n  return 'appointment';\n};\n\nconst events = items.map(item => {\n  const startDate = item.start?.date || item.start?.dateTime?.split('T')[0];\n  const endDate = item.end?.date || item.end?.dateTime?.split('T')[0];\n  return {\n    google_event_id: item.id,\n    title: item.summary || 'Kein Titel',\n    event_type: getEventType(item, item.summary),\n    event_date: startDate,\n    end_date: endDate,\n    description: (item.description || '').substring(0, 500),\n    location: item.location || null,\n    category: categorize(item.summary, item.description),\n    recurring: item.recurrence ? JSON.stringify(item.recurrence) : null,\n    recurrence: item.recurringEventId || null,\n    status: item.status === 'cancelled' ? 'cancelled' : 'upcoming',\n    source: 'google_calendar',\n    synced_at: new Date().toISOString(),\n    warning_days: 28\n  };\n});\n\nreturn [{ json: { events, count: events.length } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        400
+      ],
+      "id": "categorize_events",
+      "name": "Events kategorisieren"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 3: Upsert in calendar_events (Supabase)\nconst data = $input.first().json;\nconst events = data.events || [];\nlet inserted = 0, updated = 0, cancelled = 0;\n\nfor (const event of events) {\n  // Check if event exists\n  const checkResp = await fetch(\n    `${$env.SUPABASE_URL}/rest/v1/calendar_events?google_event_id=eq.${event.google_event_id}&select=id,status`,\n    {\n      headers: {\n        'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n        'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`\n      },\n      signal: AbortSignal.timeout(10000)\n    }\n  );\n  const existing = await checkResp.json();\n\n  if (Array.isArray(existing) && existing.length > 0) {\n    // Update existing event\n    if (event.status === 'cancelled') {\n      await fetch(\n        `${$env.SUPABASE_URL}/rest/v1/calendar_events?google_event_id=eq.${event.google_event_id}`,\n        {\n          method: 'PATCH',\n          headers: {\n            'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n            'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n            'Content-Type': 'application/json',\n            'Prefer': 'return=minimal'\n          },\n          body: JSON.stringify({ status: 'cancelled', synced_at: event.synced_at }),\n          signal: AbortSignal.timeout(10000)\n        }\n      );\n      cancelled++;\n    } else {\n      await fetch(\n        `${$env.SUPABASE_URL}/rest/v1/calendar_events?google_event_id=eq.${event.google_event_id}`,\n        {\n          method: 'PATCH',\n          headers: {\n            'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n            'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n            'Content-Type': 'application/json',\n            'Prefer': 'return=minimal'\n          },\n          body: JSON.stringify({\n            title: event.title,\n            event_date: event.event_date,\n            end_date: event.end_date,\n            description: event.description,\n            location: event.location,\n            category: event.category,\n            event_type: event.event_type,\n            synced_at: event.synced_at\n          }),\n          signal: AbortSignal.timeout(10000)\n        }\n      );\n      updated++;\n    }\n  } else {\n    // Insert new event\n    await fetch(\n      `${$env.SUPABASE_URL}/rest/v1/calendar_events`,\n      {\n        method: 'POST',\n        headers: {\n          'apikey': $env.SUPABASE_SERVICE_ROLE_KEY,\n          'Authorization': `Bearer ${$env.SUPABASE_SERVICE_ROLE_KEY}`,\n          'Content-Type': 'application/json',\n          'Prefer': 'return=minimal'\n        },\n        body: JSON.stringify(event),\n        signal: AbortSignal.timeout(10000)\n      }\n    );\n    inserted++;\n  }\n}\n\nreturn [{ json: { total: events.length, inserted, updated, cancelled } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        400
+      ],
+      "id": "upsert_events",
+      "name": "Supabase Upsert"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 4: Logger\nconst data = $input.first().json;\nreturn [{ json: {\n  session_id: 'calendar_sync_' + new Date().toISOString().split('T')[0],\n  agent_name: 'calendar_sync',\n  model: 'none',\n  input_summary: `${data.total} Events geladen`,\n  output_summary: `${data.inserted} neu, ${data.updated} aktualisiert, ${data.cancelled} cancelled`,\n  tokens_in: 0,\n  tokens_out: 0\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        400
+      ],
+      "id": "prepare_cal_log",
+      "name": "Log-Daten"
+    },
+    {
+      "parameters": {
+        "workflowId": "SqxGbsNqoNfioAcC",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1260,
+        400
+      ],
+      "id": "log_calendar",
+      "name": "Agent Logger",
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Alle 6 Stunden": {
+      "main": [
+        [
+          {
+            "node": "Google Calendar Events laden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Calendar Events laden": {
+      "main": [
+        [
+          {
+            "node": "Events kategorisieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Events kategorisieren": {
+      "main": [
+        [
+          {
+            "node": "Supabase Upsert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase Upsert": {
+      "main": [
+        [
+          {
+            "node": "Log-Daten",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log-Daten": {
+      "main": [
+        [
+          {
+            "node": "Agent Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}
