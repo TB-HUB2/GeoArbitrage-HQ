@@ -20,7 +20,7 @@ Oeffne Claude Code in deinem Terminal und kopiere den jeweiligen Prompt.
 
 **Claude Code Prompt:**
 ```
-Ich moechte einen Hetzner CX22 VPS (Ubuntu 24.04) einrichten fuer mein
+Ich moechte einen Hetzner CPX22 VPS (Ubuntu 24.04) einrichten fuer mein
 GeoArbitrage-Projekt. Bitte erstelle mir:
 
 1. Ein docker-compose.yml das folgende Services enthaelt:

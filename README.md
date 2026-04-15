@@ -68,15 +68,18 @@ Ein AI-gestuetztes Virtual Family Office, das als persoenlicher Beraterstab fung
 
 | Komponente | Technologie | Kosten |
 |------------|-------------|--------|
-| Orchestrator | n8n (self-hosted, Docker auf Hetzner CX22) | 4,51 EUR/Mo |
+| Orchestrator | n8n (self-hosted, Docker auf Hetzner CPX22) | 9,51 EUR/Mo |
+| Backup | Hetzner Cloud Backup (20% des Serverpreises) | 1,90 EUR/Mo |
 | Datenbank | Supabase Free Tier (PostgreSQL + pgvector + Auth + RLS) | 0 EUR |
-| LLM | Claude API (Sonnet + Haiku, smartes Routing) | ~2-3 EUR/Mo |
+| LLM | Claude API (Sonnet + Haiku, smartes Routing) | ~2,50-3,50 EUR/Mo |
 | Embeddings | Voyage AI (voyage-4-lite, 1024 Dimensionen) | 0 EUR (Free Tier) |
 | Frontend | Next.js Dashboard auf Vercel | 0 EUR (Free Tier) |
 | Kommunikation | Telegram Bot API | 0 EUR |
 | VPN | Tailscale (n8n nie oeffentlich erreichbar) | 0 EUR (Free Tier) |
 | DNS/SSL | Cloudflare (DNS + SSL + Access) | 0 EUR (Free Tier) |
-| **Gesamt** | | **~6,50-8,50 EUR/Mo** |
+| **Gesamt** | | **~13,90-14,90 EUR/Mo** |
+
+> Preisstand: April 2026, nach Hetzner Preisanpassung. Die CPX-Linie (AMD EPYC) hat sich in der Praxis als zuverlaessiger erwiesen als CX (Intel) fuer Docker-Workloads mit n8n.
 
 ## Implementierungstool
 
@@ -163,15 +166,18 @@ template/
 
 | Posten | Kosten/Monat |
 |--------|-------------|
-| Hetzner CX22 VPS | 4,51 EUR |
-| Claude API (~80 Anfragen + Weekly Scan) | ~2-3 EUR |
+| Hetzner CPX22 VPS (2 vCPU, 4 GB RAM, 80 GB NVMe) | 9,51 EUR |
+| Hetzner Cloud Backup (20% Aufschlag, 7 Backups Retention) | 1,90 EUR |
+| Claude API (~80 Anfragen + Weekly Scan) | ~2,50-3,50 EUR |
 | Supabase Free Tier | 0 EUR |
 | Voyage AI Free Tier | 0 EUR |
 | Vercel Free Tier | 0 EUR |
 | Telegram Bot | 0 EUR |
 | Tailscale Free Tier | 0 EUR |
 | Cloudflare Free Tier | 0 EUR |
-| **Gesamt** | **~6,50-8,50 EUR** |
+| **Gesamt** | **~13,90-14,90 EUR** |
+
+> Hinweis: Die Hetzner Preisanpassung vom 1. April 2026 hat die Serverkosten um ca. 30-37% erhoeht. Wer den Backup-Service nicht nutzen moechte, kann taegliche Snapshots per `backup.sh` auf einen externen Storage Box (ab ca. 3,90 EUR/Mo) schreiben \u2014 ist aber nicht inkludiert.
 
 ## Voraussetzungen
 

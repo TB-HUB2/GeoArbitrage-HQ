@@ -17,7 +17,7 @@
 - **Sicherheit:** Tailscale VPN + fail2ban + Rate Limiting + API Spending Limits
 - **Kurs-Daten:** Yahoo Finance API + CoinGecko API + ExchangeRate-API (alle kostenlos)
 
-**Laufende Kosten:** ~6,50-8,50€/Monat (nach initialem Setup, inkl. wöchentlichem Scan)
+**Laufende Kosten:** ~13,90-14,90€/Monat (Stand April 2026, nach Hetzner-Preisanpassung, inkl. wöchentlichem Scan und Cloud Backup)
 
 **Implementierungstool:** Claude Code (CLI-basierter Coding-Agent)
 
@@ -143,11 +143,13 @@ brew install node
 ```
 Node.js wird für Claude Code und das n8n-mcp Paket benötigt.
 
-**Was passiert:** Du mietest einen Hetzner Cloud Server (CX22, 4.51€/Mo), installierst Docker und Docker Compose, und setzt n8n als Container auf.
+**Was passiert:** Du mietest einen Hetzner Cloud Server (CPX22, 9,51€/Mo + ~1,90€/Mo fuer Backup), installierst Docker und Docker Compose, und setzt n8n als Container auf.
+
+> **WICHTIG:** Nimm **CPX22** (AMD EPYC, 80 GB NVMe) und NICHT CPX22 (Intel, 40 GB SSD). Die CPX-Linie hat sich im Betrieb als stabiler fuer Docker/n8n erwiesen, und die 80 GB Disk sind fuer die Knowledge Base + Backups wichtig.
 
 **Claude Code Prompt:**
 ```
-Ich möchte einen Hetzner CX22 VPS (Ubuntu 24.04) einrichten für mein 
+Ich möchte einen Hetzner CPX22 VPS (Ubuntu 24.04) einrichten für mein 
 GeoArbitrage-Projekt. Bitte erstelle mir:
 
 1. Ein docker-compose.yml das folgende Services enthält:
@@ -786,7 +788,7 @@ SICHERHEITS-ANFORDERUNGEN (nicht verhandelbar):
 
 **Manuelle Schritte (nicht automatisierbar):**
 - Hetzner Account erstellen: https://www.hetzner.com/cloud
-- CX22 Server bestellen (Ubuntu 24.04, Düsseldorf Standort)
+- CPX22 Server bestellen (Ubuntu 24.04, Düsseldorf Standort)
 - Domain kaufen oder Subdomain einrichten (z.B. bei Cloudflare)
 - DNS A-Record: webhook.deinedomain.de → Server-IP
   (NUR der Webhook braucht die Domain. Dashboard läuft auf Vercel 
@@ -1980,7 +1982,7 @@ CHECK 1 — SERVER-GESUNDHEIT:
      ALERT wenn ein Container nicht "Up" ist
    - Uptime: uptime → Tage seit letztem Reboot
    - Load Average: cat /proc/loadavg → 5min Average
-     ALERT wenn > 2.0 (CX22 hat 2 vCPUs)
+     ALERT wenn > 2.0 (CPX22 hat 2 vCPUs)
 
 CHECK 2 — SSL-ZERTIFIKATE:
    Bash Node:
@@ -2390,18 +2392,18 @@ Hetzner Snapshots sichern den gesamten VPS-Zustand (OS, Docker, Daten, Konfigura
 **Einrichtung (einmalig, ~5 Minuten):**
 
 1. Hetzner Cloud Console → Dein Server → "Backups" Tab
-2. "Backups aktivieren" — Kosten: 20% des Server-Preises = **~0,90€/Mo** für CX22
+2. "Backups aktivieren" — Kosten: 20% des Server-Preises = **~1,90€/Mo** für CPX22
 3. Hetzner erstellt automatisch tägliche Snapshots (max. 7 werden behalten)
 4. Alternativ: Manuellen Snapshot vor jedem Update erstellen (kostenlos, max 2GB)
 
 **Wiederherstellung aus Hetzner Snapshot:**
 1. Hetzner Console → "Neuen Server erstellen"
 2. Image-Quelle: "Snapshots" → Gewünschtes Datum wählen
-3. Gleichen Server-Typ (CX22) wählen → Erstellen
+3. Gleichen Server-Typ (CPX22) wählen → Erstellen
 4. Neue IP-Adresse in Tailscale und DNS aktualisieren
 5. Fertig — kompletter Server ist wiederhergestellt
 
-**Kosten:** ~0,90€/Monat (laufend) oder 0€ (nur manuelle Snapshots vor Updates)
+**Kosten:** ~1,90€/Monat (laufend, 20% des Serverpreises) oder 0€ (nur manuelle Snapshots vor Updates)
 
 ##### Backup-Frequenz ändern: Wöchentlich → Täglich
 
@@ -2454,7 +2456,7 @@ Backup-Datei: backup_YYYYMMDD.tar.gz.enc
       - Fehlgeschlagen: "[Fehler beschreiben]" → SOFORT fixen
 
 OPTIONAL (alle 3 Monate — Full Restore Test):
-[ ] 6. Temporären Hetzner VPS erstellen (CX22, wird nach Test gelöscht)
+[ ] 6. Temporären Hetzner VPS erstellen (CPX22, wird nach Test gelöscht)
 [ ] 7. restore.sh auf frischem VPS ausführen
 [ ] 8. Prüfen: n8n erreichbar, Workflows vorhanden, Credentials funktionieren
 [ ] 9. VPS löschen (Kosten: ~0,01€ für 30 Min Nutzung)
@@ -4202,19 +4204,20 @@ Dokumentiere jede Rotation im Passwort-Manager mit Datum.
 
 | Posten | Kosten |
 |--------|--------|
-| Hetzner VPS (1. Monat) | 4,51€ |
+| Hetzner CPX22 VPS (1. Monat) | 9,51€ |
+| Hetzner Cloud Backup (1. Monat) | 1,90€ |
 | Claude API (intensive Phase, ~50 Anfragen) | ~10-15€ |
 | Voyage AI Embeddings (KB-Aufbau) | 0€ (Free Tier: 200M Tokens) |
 | Domain (optional) | ~10€/Jahr |
-| **Gesamt Setup** | **~25-30€** |
+| **Gesamt Setup** | **~30-35€** |
 
 ### Laufend (pro Monat)
 
 | Posten | Kosten | Anmerkung |
 |--------|--------|-----------|
-| Hetzner VPS | 4,51€ | |
-| Hetzner Snapshots (täglich, automatisch) | ~0,90€ | |
-| Claude API (Agenten + Weekly Scan) | ~1,50-3€ | Reduziert durch RAG (~70% weniger Input-Tokens) + DA-Konsolidierung (1 statt 2 QC-Calls) |
+| Hetzner CPX22 VPS | 9,51€ | 2 vCPU AMD EPYC, 4 GB RAM, 80 GB NVMe — Preis nach April-2026-Anpassung |
+| Hetzner Cloud Backup | ~1,90€ | 20% Aufschlag auf den Serverpreis, 7 Tage Retention |
+| Claude API (Agenten + Weekly Scan) | ~2,50-3,50€ | Sonnet 4.6 ($3/$15 pro MTok) + Haiku 4.5 ($1/$5), reduziert durch RAG (~70% weniger Input-Tokens) + DA-Konsolidierung (1 statt 2 QC-Calls) |
 | Weekly Scan OSINT (GDELT, ACLED, Polymarket) | 0€ | Free APIs |
 | Voyage AI Embeddings (RAG-Queries) | 0€ | Free Tier: 200M Tokens, ~1.600 Tokens/Mo bei 80 Anfragen |
 | Supabase (inkl. pgvector) | 0€ | Free Tier |
@@ -4223,7 +4226,7 @@ Dokumentiere jede Rotation im Passwort-Manager mit Datum.
 | Vercel | 0€ | Free Tier |
 | Yahoo Finance / CoinGecko | 0€ | Free APIs |
 | Telegram Bot API | 0€ | Vollständig kostenlos, kein Limit |
-| **Gesamt pro Monat** | **~7-8,50€** | Vorher ~7,50-9,50€ — Ersparnis durch RAG + QC-Konsolidierung |
+| **Gesamt pro Monat** | **~13,90-14,90€** | Preisstand April 2026 nach Hetzner-Anpassung (CPX22 stieg um ca. 30-37%) |
 
 ---
 
@@ -4242,7 +4245,7 @@ Erstelle diese Accounts BEVOR du mit Sprint 1 startest:
 
 ### Pre-Flight: Infrastruktur (nach VPS-Erstellung)
 
-- [ ] **Hetzner Snapshots aktivieren** — Cloud Console → Server → Backups → Aktivieren (~0,90€/Mo). Tägliche automatische Snapshots als Disaster-Recovery-Basis.
+- [ ] **Hetzner Snapshots aktivieren** — Cloud Console → Server → Backups → Aktivieren (~1,90€/Mo, 20% des Serverpreises). Tägliche automatische Snapshots als Disaster-Recovery-Basis.
 - [ ] **Key-Rotation-Checklist** — Halbjährliche Rotation dokumentiert in **security-architecture.md**, Abschnitt "Key-Rotation-Checklist"
 
 ### Accounts
@@ -4267,7 +4270,7 @@ Erstelle diese Accounts BEVOR du mit Sprint 1 startest:
 
 | Begriff | Bedeutung |
 |---------|-----------|
-| **VPS** | Virtual Private Server — ein gemieteter Server in der Cloud (wie Hetzner CX22) |
+| **VPS** | Virtual Private Server — ein gemieteter Server in der Cloud (wie Hetzner CPX22) |
 | **SSH** | Secure Shell — verschlüsselte Verbindung zu deinem Server (statt Passwort: Key-basiert) |
 | **Docker** | Software die Apps in isolierten "Containern" ausführt — n8n läuft in einem Container |
 | **n8n** | Workflow-Automatisierungstool — das "Gehirn" das deine AI-Agenten orchestriert |

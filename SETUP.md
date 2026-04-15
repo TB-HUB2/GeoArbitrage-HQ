@@ -6,9 +6,9 @@
 
 | Account | URL | Zweck | Kosten |
 |---------|-----|-------|--------|
-| Hetzner Cloud | hetzner.com/cloud | VPS fuer n8n | 4,51 EUR/Mo (CX22) |
+| Hetzner Cloud | hetzner.com/cloud | VPS fuer n8n | 9,51 EUR/Mo (CPX22) + 1,90 EUR/Mo Backup |
 | Supabase | supabase.com | Datenbank + Auth | Free Tier |
-| Anthropic | console.anthropic.com | Claude API (LLM) | Pay-per-use (~2-3 EUR/Mo) |
+| Anthropic | console.anthropic.com | Claude API (LLM) | Pay-per-use (~2,50-3,50 EUR/Mo) |
 | Voyage AI | dash.voyageai.com | Embeddings | Free Tier (200M Tokens) |
 | Tailscale | tailscale.com | VPN (n8n-Zugang) | Free Tier |
 | Cloudflare | cloudflare.com | DNS + SSL + Access | Free Tier |
@@ -28,7 +28,8 @@
 
 ### 1. Hetzner VPS bestellen
 
-- Server-Typ: CX22 (2 vCPU, 4 GB RAM, 40 GB SSD)
+- Server-Typ: **CPX22** (2 vCPU AMD EPYC, 4 GB RAM, 80 GB NVMe SSD) — NICHT CX22! Die CPX-Linie hat sich als stabiler fuer Docker/n8n erwiesen
+- Backup-Addon aktivieren (20% Aufpreis = ~1,90 EUR/Mo, 7 Tage Retention) — empfohlen
 - OS: Ubuntu 24.04
 - Standort: Nuernberg oder Falkenstein
 - SSH-Key hinzufuegen (nicht Passwort-Login!)

@@ -352,7 +352,7 @@ Dieses Projekt ist ein AI-gestuetztes Virtual Family Office ("GeoArbitrage HQ").
 - API Key: In /opt/geoarbitrage/.env -> N8N_API_KEY (NICHT hier eintragen!)
 
 ## Tech-Stack
-- **Orchestrator**: n8n 2.14+ (Docker auf Hetzner CX22)
+- **Orchestrator**: n8n 2.14+ (Docker auf Hetzner CPX22, 9,51 EUR/Mo + 1,90 EUR Backup — NICHT CX22!)
 - **DB**: Supabase Free Tier (PostgreSQL + pgvector)
 - **LLM**: Claude Sonnet 4.6 (Sonnet-Agenten) + Claude Haiku 4.5 (Haiku-Agenten)
 - **Embeddings**: Voyage AI voyage-4-lite (1024 Dimensionen)
